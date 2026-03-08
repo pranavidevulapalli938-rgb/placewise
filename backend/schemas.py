@@ -1,55 +1,86 @@
 from pydantic import BaseModel, EmailStr, Field
+from datetime import datetime
+from typing import Optional
+from enum import Enum
 
-# --------- REQUEST SCHEMA ---------
+
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str = Field(..., min_length=8, max_length=50)
+    password: str = Field(..., min_length=8, max_length=100)
 
 
-# --------- RESPONSE SCHEMA ---------
 class UserResponse(BaseModel):
     id: int
     email: EmailStr
 
     class Config:
         from_attributes = True
-        
-        
-# Login request schema
+
+
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
 
-#Application create
+class ApplicationStatus(str, Enum):
+    applied             = "Applied"
+    oa_received         = "OA Received"
+    interview_scheduled = "Interview Scheduled"
+    selected            = "Selected"
+    rejected            = "Rejected"
+
 
 class ApplicationCreate(BaseModel):
-    company: str
-    role: str
+    company:    str = Field(..., min_length=1, max_length=200)
+    role:       str = Field(..., min_length=1, max_length=200)
+    source_url: Optional[str] = None   # job listing URL (LinkedIn, Naukri, etc.)
 
 
-# ---------- APPLICATION RESPONSE ----------
 class ApplicationResponse(BaseModel):
-    id: int
-    company: str
-    role: str
-    status: str
+    id:               int
+    company:          str
+    role:             str
+    status:           str
+    applied_date:     Optional[datetime] = None
+    gmail_message_id: Optional[str] = None
+    source_url:       Optional[str] = None  # NEW
 
     class Config:
         from_attributes = True
 
 
-# ---------- STATUS UPDATE ----------
 class StatusUpdate(BaseModel):
-    status: str
+    status: ApplicationStatus
 
 
-# ---------- NOTE CREATE ----------
 class NoteCreate(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1, max_length=2000)
+
+
+class NoteResponse(BaseModel):
+    id:         int
+    text:       str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SupportedLanguage(str, Enum):
+    python = "python"
+    java   = "java"
 
 
 class CodePayload(BaseModel):
-    language: str
-    code: str
+    language: SupportedLanguage
+    code:     str = Field(..., max_length=10_000)
 
+
+# ── Password Reset ────────────────────────────────────────────────────────────
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token:        str
+    new_password: str = Field(..., min_length=8, max_length=100)

@@ -1,37 +1,45 @@
+const BACKEND_URL = "https://placewise-backend.onrender.com"; // ← update to your Render URL
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "SEND_TO_BACKEND") {
-    // 1. Retrieve the saved JWT token
     chrome.storage.local.get(["token"], (result) => {
       const token = result.token;
 
-      // 2. Make the API call to your FastAPI server
-      fetch("http://localhost:8000/applications", {
+      if (!token) {
+        sendResponse({ success: false, error: "Not logged in" });
+        return;
+      }
+
+      fetch(`${BACKEND_URL}/applications`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}` 
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           company: request.data.company,
-          role: request.data.title, // Maps 'title' from JS to 'role' in Python
-          status: "Applied"
+          role:    request.data.title,
         })
       })
       .then(async (response) => {
-  const data = await response.json();  // <-- get backend JSON
-
-  if (response.ok) {
-    sendResponse({ success: true, data: data }); // <-- forward it
-  } else {
-    console.error("Backend Error:", data);
-    sendResponse({ success: false, error: data });
-  }
-})
+        const data = await response.json();
+        if (response.ok) {
+          sendResponse({ success: true, data });
+        } else {
+          // FIX: handle 401 specifically so popup can prompt re-login
+          if (response.status === 401) {
+            chrome.storage.local.remove(["token"]);
+            sendResponse({ success: false, error: "Session expired. Please log in again.", code: 401 });
+          } else {
+            sendResponse({ success: false, error: data.detail || "Backend error" });
+          }
+        }
+      })
       .catch((err) => {
-        console.error("Fetch Error:", err);
-        sendResponse({ success: false, error: err.message });
+        sendResponse({ success: false, error: "Cannot reach backend. Is it running?" });
       });
     });
-    return true; // Keeps the communication channel open for the async fetch
+
+    return true; // Keep channel open for async
   }
 });

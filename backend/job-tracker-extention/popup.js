@@ -53,7 +53,7 @@ document.getElementById("loginBtn").onclick = async () => {
   statusMsg.innerText = "Logging in...";
 
   try {
-    const res = await fetch("http://localhost:8000/login", {
+    const res = await fetch("https://placewise-backend.onrender.com/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, password }),
