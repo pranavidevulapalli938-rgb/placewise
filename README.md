@@ -4,6 +4,8 @@
 
 🌐 **Live Demo:** [placewise-azure.vercel.app](https://placewise-azure.vercel.app)
 
+> Built as a group project by three contributors — see [Team](#-team) below.
+
 ---
 
 ## ✨ Features
@@ -43,6 +45,16 @@
 
 ---
 
+## 👥 Team
+
+| Contributor | GitHub | Responsibilities |
+|-------------|--------|-----------------|
+| Pranavi Devulapalli | [@pranavidevulapalli938-rgb](https://github.com/pranavidevulapalli938-rgb) | Frontend (React), Gmail parser & OAuth integration |
+| Isha | [@Isha0816](https://github.com/Isha0816) | FastAPI backend, Chrome extension |
+| Nayana Reddy K | [@NayanaReddyK](https://github.com/NayanaReddyK) | AI placement server, Gemini API integration |
+
+---
+
 ## 🛠️ Tech Stack
 
 | Layer | Technology |
@@ -67,7 +79,7 @@
 
 ```
 placewise/
-├── frontend/               # React + Vite app
+├── frontend/               # React + Vite app (pranavidevulapalli938-rgb)
 │   ├── src/
 │   │   ├── pages/
 │   │   │   ├── Dashboard.jsx
@@ -83,27 +95,25 @@ placewise/
 │   │   │   └── AuthContext.jsx
 │   │   ├── App.jsx
 │   │   └── main.jsx
-│   ├── public/
-│   │   └── placewise-extension.zip
 │   └── package.json
 │
-├── backend/                # FastAPI Python app
+├── backend/                # FastAPI Python app (Isha0816)
 │   ├── main.py
 │   ├── auth.py
 │   ├── models.py
 │   ├── schemas.py
 │   ├── database.py
-│   ├── gmail_parser.py
+│   ├── gmail_parser.py     # (pranavidevulapalli938-rgb)
 │   ├── requirements.txt
 │   └── .env
 │
-├── extension/              # Chrome extension
+├── extension/              # Chrome extension (Isha0816)
 │   ├── manifest.json
 │   ├── background.js
 │   ├── popup.js
 │   └── popup.html
 │
-└── ai_placement/           # Node.js AI server
+└── ai_placement/           # Node.js AI server (NayanaReddyK)
     └── server/
         └── server.js
 ```
@@ -115,12 +125,12 @@ placewise/
 ### Prerequisites
 - Node.js 18+
 - Python 3.10+
-- PostgreSQL (local or Neon)
+- PostgreSQL (local or [Neon](https://neon.tech))
 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/placewise.git
+git clone https://github.com/pranavidevulapalli938-rgb/placewise.git
 cd placewise
 ```
 
@@ -129,6 +139,7 @@ cd placewise
 ```bash
 cd backend
 python -m venv venv
+
 # Windows:
 venv\Scripts\activate
 # macOS/Linux:
@@ -199,7 +210,7 @@ npm run dev
 
 A batch script is included to launch all three servers at once:
 
-```bash
+```bat
 start_placewise.bat
 ```
 
@@ -207,7 +218,7 @@ start_placewise.bat
 
 ## 🔌 Chrome Extension
 
-1. From the Dashboard, click **Download Extension** (or the Extension button)
+1. From the Dashboard, click **Download Extension**
 2. Unzip the downloaded file
 3. Open Chrome → `chrome://extensions`
 4. Enable **Developer mode** (top-right toggle)
@@ -215,13 +226,13 @@ start_placewise.bat
 6. The PlaceWise icon appears in your toolbar
 7. Browse a job board and click the icon to save jobs instantly
 
-> Supported job boards: Naukri, LinkedIn, Internshala, Indeed, Wellfound
+> **Supported job boards:** Naukri, LinkedIn, Internshala, Indeed, Wellfound
 
 ---
 
 ## ☁️ Deployment
 
-See [Deployment.md](./Deployment.md) for the full guide. Summary:
+See [Deployment.md](./Deployment.md) for the full step-by-step guide. Summary:
 
 | Service | Purpose | Free Tier |
 |---------|---------|-----------|
@@ -229,54 +240,29 @@ See [Deployment.md](./Deployment.md) for the full guide. Summary:
 | [Render](https://render.com) | Backend hosting | 750 hrs/month |
 | [Neon](https://neon.tech) | PostgreSQL | 0.5 GB |
 
-### Key environment variables for production
+**Key environment variables for production:**
 
-**Vercel (Frontend):**
-```
-VITE_API_URL = https://your-backend.onrender.com
-VITE_AI_URL  = https://your-ai-server.onrender.com
-```
+```env
+# Vercel (Frontend)
+VITE_API_URL=https://your-backend.onrender.com
+VITE_AI_URL=https://your-ai-server.onrender.com
 
-**Render (Backend):** Set all variables from the `.env` template above, using your production URLs.
+# Render (Backend) — set all .env variables using production URLs
+FRONTEND_URL=https://your-app.vercel.app
+GOOGLE_REDIRECT_URI=https://your-backend.onrender.com/gmail/callback
+```
 
 ---
 
-## 🔐 Authentication Flow
+## 🔐 Authentication
 
-- **Register** → email + password → stored with bcrypt hash
+- **Register** → email + password stored with bcrypt hash
 - **Login** → returns JWT → stored in `localStorage` (remember me) or `sessionStorage`
-- **Remember Me** → token persists across browser sessions
 - **Forgot Password** → email link with 30-minute expiry token
-- **Google OAuth** → Gmail connect for email sync (separate from login)
-
----
-
-## 📸 Screenshots
-
-| Dashboard | Kanban | Interview Prep |
-|-----------|--------|----------------|
-| Application tracker with stats | Drag-and-drop pipeline | AI HR & coding practice |
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Commit your changes: `git commit -m 'Add your feature'`
-4. Push to the branch: `git push origin feature/your-feature`
-5. Open a Pull Request
+- **Google OAuth 2.0** → Gmail connect for email auto-sync
 
 ---
 
 ## 📄 License
 
-MIT License — see [LICENSE](./LICENSE) for details.
-
----
-
-## 🙏 Acknowledgements
-
-- [Gemini API](https://ai.google.dev/) for AI interview prep features
-- [Neon](https://neon.tech/) for serverless PostgreSQL
-- [Render](https://render.com/) & [Vercel](https://vercel.com/) for free hosting
+This project is licensed under the MIT License — see [LICENSE](./LICENSE) for details.
