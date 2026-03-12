@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+python-dotenv
+python-jose[cryptography]
+passlib[argon2]
+pydantic[email]
+httpx
+google-auth
+google-auth-oauthlib
+google-api-python-client
+google-generativeai
+python-multipart
+argon2-cffi
+beautifulsoup4
