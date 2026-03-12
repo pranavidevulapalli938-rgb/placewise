@@ -76,7 +76,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "chrome-extension://*"],
+    allow_origins=[
+    os.getenv("FRONTEND_URL", "http://localhost:5173"),
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "chrome-extension://*"
+],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -142,6 +147,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/login", tags=["Auth"])
+@app.post("/auth/login", tags=["Auth"])
 def login(user: UserLogin, db: Session = Depends(get_db)):
     existing_user = db.query(User).filter(User.email == user.email).first()
     if not existing_user or not verify_password(user.password, existing_user.password):
@@ -864,3 +870,4 @@ def execute_code(payload: CodePayload):
         return {"error": "Execution timed out (5s limit)", "stdout": "", "stderr": ""}
     except Exception as e:
         return {"error": str(e), "stdout": "", "stderr": ""}
+
