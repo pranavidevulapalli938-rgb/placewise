@@ -1,9 +1,7 @@
-# Environment variables
-.env
-
-# Python cache
+node_modules/
+venv/
 __pycache__/
 *.pyc
-
-# Virtual environment
-venv/
+.env
+frontend/.env.development
+frontend/.env.production
