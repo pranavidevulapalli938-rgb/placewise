@@ -1,12 +1,63 @@
 import os
-import base64
 import re
+import json
+import base64
+import time
+import threading as _threading
+import httpx
+
+# ── Groq rate limiter (free tier = 30 req/min = 1 every 2s) ──────────────────
+_groq_lock      = _threading.Lock()
+_groq_last_call = 0.0
+_GROQ_MIN_GAP   = 3.0   # 3s gap = max 20 req/min, well under 30 req/min limit
+
+def _groq_rate_limit():
+    """Block until it's safe to make another Groq API call."""
+    global _groq_last_call
+    with _groq_lock:
+        now  = time.time()
+        wait = _GROQ_MIN_GAP - (now - _groq_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _groq_last_call = time.time()
+# ─────────────────────────────────────────────────────────────────────────────
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── IPv4 fix for httplib2 on Windows ─────────────────────────────────────────
+import socket as _socket
+_orig_getaddrinfo = _socket.getaddrinfo
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+_socket.getaddrinfo = _ipv4_only_getaddrinfo
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Groq setup ────────────────────────────────────────────────────────────────
+# Groq is free (14,400 req/day, 30 req/min) and uses OpenAI-compatible API.
+# Get your free key at: https://console.groq.com
+# No quota sharing with other services — completely isolated.
+
+# ── LLM backend — Claude Haiku (Anthropic) ───────────────────────────────
+# Cost: ~₹20 per full 624-email sync, ~₹2/month normal use
+# Accuracy: ~97% — best in class for email classification
+# Get key at: https://console.anthropic.com → API Keys
+# Add to .env: ANTHROPIC_API_KEY=sk-ant-...
+# Falls back to Groq if Anthropic key missing, then regex if both missing.
+
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL   = "claude-haiku-4-5-20251001"  # Cheapest + most accurate
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama-3.1-8b-instant"   # 14,400 req/day free (70b = only 1,000/day)
+
+def _get_anthropic_key() -> str | None:
+    return os.getenv("ANTHROPIC_API_KEY") or None
+
+def _get_groq_key() -> str | None:
+    return os.getenv("GROQ_API_KEY") or None
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 # VERSION 7 - HTML body extraction, all rejection phrases, clean code
@@ -71,15 +122,26 @@ UNSTOP_DOMAINS = {"unstop", "unstop.com", "unstop.email", "unstop.events"}
 # NOTE: "internshala" is intentionally NOT in this list — Internshala sends real
 # hiring/selected/interview emails and "Internshala" is a valid company to track.
 PLATFORM_COMPANY_NAMES = {
-    "recooty", "indeedapply", "indeed",
+    "recooty", "indeedapply", "indeed", "indeed apply",
     "wellfound", "greenhouse", "lever", "workday", "bamboohr", "smartrecruiters",
     "unstop", "unstop events", "naukri", "jobalert", "jobalerts", "job alert",
-    "job alerts", "linkedin job alerts", "linkedin jobs", "naukricampus",
+    "job alerts", "linkedin", "linkedin job alerts", "linkedin jobs", "naukricampus",
     "dare2compete", "cutshort", "hirist", "iimjobs", "foundit", "apna",
     "shine", "monster", "timesjobs", "ambitionbox", "jobsora",
     "recruitee", "jobvite", "icims", "taleo", "successfactors", "pinpoint",
     "ashbyhq", "rippling", "dover", "teamtailor", "comeet", "freshteam",
     "zohorecruit", "occupop", "jazzhr", "jobsoid", "betterteam", "manatal",
+    # ATS platforms that send on behalf of companies (global)
+    "darwinbox", "keka", "kekahr", "greythr", "sumhr", "hibob", "personio",
+    "factorial", "workable", "myworkday", "oracle", "oraclehcm",
+    "paycor", "adp", "kronos", "ultipro", "sap", "sapsuccessfactors",
+    "hirevue", "mettl", "mymettl", "devskiller", "vervoe", "testgorilla",
+    "skillsignal", "criteria", "wayup", "handshake", "joinhandshake",
+    "wellfound", "greenhouse-mail", "lever.co", "beamery",
+    # Generic display names that are not companies
+    "hr team", "recruitment team", "talent acquisition", "hiring team",
+    "talent team", "people team", "careers team", "jobs team",
+    "no reply", "noreply", "do not reply", "donotreply",
     # EdTech platforms — should never appear as a company name in job tracking
     "greatlearning", "great learning", "coding ninjas", "codingninjas",
     "simplilearn", "upgrad", "scaler", "pwskills", "masai school", "masaischool",
@@ -87,6 +149,8 @@ PLATFORM_COMPANY_NAMES = {
     # Generic category words that get extracted as company names
     "courses", "certifications", "certification", "certificate",
     "quora", "quora digest",
+    # Generic domain names that get extracted as company via domain fallback
+    "careers", "career", "jobs", "hiring", "recruitment", "talent",
 }
 
 PLACEMENT_OVERRIDE_SUBJECTS = [
@@ -103,6 +167,15 @@ PLACEMENT_OVERRIDE_SUBJECTS = [
     "thank you for submitting", "your application with",
     "update from", "thanks from", "your update from",
     "received your job application", "job application",
+    # LinkedIn "viewed" emails — hiring team saw the application
+    "your application was viewed",
+    "application was viewed by",
+    # Darwinbox ATS confirmation emails
+    "candidate application has been submitted",
+    "application has been submitted successfully",
+    "submitted successfully",
+    # Indeed confirmation emails
+    "indeed application:",
     # Indeed-style rejection subjects
     "an update on your application from",
     "update on your application from",
@@ -131,6 +204,15 @@ PLACEMENT_OVERRIDE_SUBJECTS = [
     "application unsuccessful",
     "we appreciate your interest",
     "thank you for your interest in",
+    # "your application status update is here" — Unstop/platform status emails
+    "your application status update is here",
+    "application status update is here",
+    "your missing application status update",
+    "the application status update is here",
+    # "your profile has been shortlisted for the next step"
+    "shortlisted for the next step",
+    # "Application Received:" direct confirmation
+    "application received:",
 ]
 
 
@@ -167,7 +249,7 @@ PROMOTIONAL_SUBJECT_PATTERNS = [
     r"placement stress",
     r"career (guidance|shortcut|start)",
     r"(mentors?|mentor) (can help|whose)",
-    r"(your|pranavi)[,\s]+ (from|engineering|these)",  # Mentor spam
+    r"(your),\s+(from|engineering|these)\b",  # Mentor spam generic
     # EdTech promo subject patterns
     r"(microsoft|google|amazon|ibm|flipkart).*(in \d+ (months?|weeks?))",  # "Microsoft in 6 months"
     r"(in \d+ (months?|weeks?)).*(microsoft|google|amazon|ibm)",
@@ -180,6 +262,50 @@ PROMOTIONAL_SUBJECT_PATTERNS = [
     r"(job bootcamp|job guarantee|placement guarantee)",
     r"top stories for",              # Quora digest subject
     r"quora digest",
+    # Account registration / welcome emails — NOT job application confirmations
+    # e.g. "Welcome to Microsoft Careers!" is a portal signup, not a job application
+    r"^welcome to ",
+    r"^welcome! ",
+    r"created your account",
+    r"complete your profile",
+    r"verify your (email|account)",
+    r"confirm your (email|account)",
+    r"account (created|activated|verified)",
+    r"activate your account",
+    r"set up your (account|profile)",
+    r"get started (with|on)",
+    r"you(r| have) (successfully )?(signed up|registered|created an account)",
+    # ── LinkedIn connection / social notifications ─────────────────────────
+    # These NEVER contain job application info — pure social noise
+    r"accepted your invitation",
+    r"accepted your connection",
+    r"explore their network",
+    r"^you have \d+ new invitation",
+    r"^you have an invitation",
+    r"^you have a new message",
+    r"sent you a connection",
+    r"wants to connect",
+    r"people you may know",
+    r"commented::",                     # LinkedIn comment notifications
+    r"💬.+commented",
+    # ── Generic congratulations with no job context ────────────────────────
+    # "Congratulations!" alone is NOT a job email — real ones say the company name
+    r"^congratulations!?\s*$",          # Subject is literally just "Congratulations!"
+    r"^congratulations are in order",
+    r"you're now registered with",
+    r"successfully registered",
+    r"registered with bse",
+    # ── Insurance / banking / non-job notifications ────────────────────────
+    r"pa insurance is issued",
+    r"pnr no\.",
+    r"(your|a) (train|flight|bus|hotel) (ticket|booking|reservation)",
+    # ── Turing assessment links (not job emails, just test reminders) ──────
+    r"^your login link is ready",
+    r"complete your turing assessment",
+    # ── "Update:" prefix LinkedIn emails that aren't application updates ───
+    r"^update: your invitation from",
+    r"^update: [a-z]+, your missing application",
+    r"^update: [a-z]+, the application status update is here\s*$",  # personalized non-updates
 ]
 
 
@@ -187,7 +313,30 @@ def is_promotional_email(sender: str, subject: str) -> bool:
     subject_lower = subject.lower()
     sender_lower = sender.lower()
 
-    # Hard-block known newsletter / content domains — these NEVER send job application emails
+    # ── FAST SUBJECT PRE-CHECK ─────────────────────────────────────────────
+    # Catch the most common noise emails instantly before any domain checks.
+    # These subject patterns NEVER appear in real job application emails.
+    INSTANT_SPAM_SUBJECTS = [
+        "accepted your invitation",
+        "accepted your connection",
+        "explore their network",
+        "you have 1 new invitation",
+        "you have an invitation",
+        "wants to connect",
+        "your login link is ready",
+        "complete your turing assessment",
+        "pa insurance is issued",
+        "registered with bse",
+        "update: your invitation from",
+    ]
+    if any(p in subject_lower for p in INSTANT_SPAM_SUBJECTS):
+        return True
+
+    # Also block bare "Congratulations!" with nothing after it
+    if re.match(r'^congratulations[!.]?\s*$', subject_lower):
+        return True
+
+
     NEWSLETTER_SENDER_DOMAINS = [
         "deeplearning.ai", "info.deeplearning.ai", "batch.deeplearning.ai",
         "substack.com", "beehiiv.com", "mailchimp.com", "sendgrid.net",
@@ -202,11 +351,22 @@ def is_promotional_email(sender: str, subject: str) -> bool:
         "ycombinator.com", "workatastartup.com",
         # Cold outreach / spam internship companies
         "learntricksedutech.com", "uptricks.com", "navoditainfotech.com",
+        # Global EdTech / bootcamp platforms
+        "springboard.com", "lambda.school", "lambdaschool.com",
+        "thinkful.com", "galvanize.com", "generalassemb.ly",
+        "datacamp.com", "pluralsight.com", "linkedin.com",
+        # Hackathon/contest platforms (not job portals)
+        "devpost.com", "mlh.io", "major-league-hacking.com",
+        # AI/Tech newsletters (not job portals)
+        "huggingface.co", "paperswithcode.com", "weights-biases.com",
         # Internshala Student Partner Program (ISP) is a MARKETING program, not a job
         # Real Internshala job emails come from student@internshala.com and say
         # "Congratulations! You have been selected for [Role] at [Company]"
         # ISP emails come from student@mail.internshala.com (note: mail. subdomain)
         "mail.internshala.com",
+        # internshala.com (non-mail subdomain) sends real job emails, but
+        # trainings@internshala.com is pure EdTech marketing — block it
+        "trainings@internshala.com",
         # Q&A platforms — their "interview" content is articles, not job invites
         "quora.com", "english-quora-digest@quora.com",
         # EdTech — "selected/congratulations" = course enrollment, NOT job offer
@@ -246,6 +406,38 @@ def is_promotional_email(sender: str, subject: str) -> bool:
         if any(s in subject_lower for s in digest_signals):
             return True
         # Otherwise fall through — could be a real rejection
+
+    # Internshala student@internshala.com sends BOTH real job emails AND marketing.
+    # Real emails: "Congratulations! You have been selected for [Role] at [Company]"
+    # Marketing: offer letter guarantee promos, ISP, profile boost, application nudges
+    if "student@internshala.com" in sender_lower:
+        INTERNSHALA_MARKETING_SUBJECTS = [
+            "offer letter is guaranteed",
+            "confirm your offer letter",
+            "your offer letter is confirmed",
+            "offer letter after this",
+            "guarantee your offer",
+            "your application needs action",
+            "application is pending for submissio",
+            "a quick update for your application boost",
+            "high chance of getting shortli",
+            "invitation to apply from",
+            "your application boost",
+            # removed: personalized registration prompt (now handled by generic patterns)
+        ]
+        if any(p in subject_lower for p in INTERNSHALA_MARKETING_SUBJECTS):
+            return True
+        # Real Internshala selection emails always say "selected for [Role] at [Company]"
+        INTERNSHALA_REAL_SIGNALS = [
+            "congratulations! you have been selected for",
+            "you have been selected for",
+            "shortlisted for interview",
+            "interview call from",
+            "offer from",
+        ]
+        if any(s in subject_lower for s in INTERNSHALA_REAL_SIGNALS):
+            return False
+        # Default: let through (regex will decide if it matches a status)
 
     # Unstop sends REAL rejection/selection emails — only block their promos, not real ones
     is_unstop = any(d in sender_lower for d in ["unstop.com", "unstop.email", "unstop.events", "@unstop"])
@@ -312,22 +504,39 @@ def parse_email_for_status(subject: str, body: str) -> str | None:
     text = (subject + " " + body).lower()
 
     # SELECTED
+    # IMPORTANT: Microsoft application emails contain phrases like:
+    # "if you're selected for an interview" / "if you are selected for an interview"
+    # These are conditional future tense — NOT a real job offer.
+    # All "selected" phrases must be guarded against "if/should/when/once" prefixes.
     SELECTED_PHRASES = [
         "offer letter", "pleased to offer you", "happy to inform you",
         "we are delighted to offer", "congratulations on your selection",
-        "you have been selected", "you have been chosen", "welcome aboard",
+        "you have been chosen", "welcome aboard",
         "joining date", "your joining", "extend an offer to you",
         "we would like to offer you", "pleased to extend", "selected for the role",
         "selected for the position", "pleased to welcome you",
-        "you are selected", "you've been selected", "happy to welcome you",
+        "happy to welcome you",
         # Unstop / platform acceptance phrasing
-        "your application has been accepted", "application has been accepted",
         "has been accepted for the role", "accepted for the position",
         "happy to accept your application", "your profile has been accepted",
         "pleased to accept", "accepted your application",
     ]
     if any(p in text for p in SELECTED_PHRASES):
         return "Selected"
+
+    # These phrases need conditional guards — must NOT be preceded by if/should/when/once/until
+    CONDITIONAL_SELECTED = [
+        r'you have been selected',
+        r"you've been selected",
+        r'you are selected',
+        r"you're selected",
+        r'your application has been accepted',
+        r'application has been accepted',
+    ]
+    CONDITIONAL_PREFIX = r'(?<!if )(?<!should )(?<!when )(?<!once )(?<!until )'
+    for pattern in CONDITIONAL_SELECTED:
+        if re.search(CONDITIONAL_PREFIX + pattern, text):
+            return "Selected"
 
     # OA
     OA_PHRASES = [
@@ -562,6 +771,18 @@ def parse_email_for_status(subject: str, body: str) -> str | None:
         "thanks - we've received your job application",
         "your application has been received and is under review",
         "thanks for your interest in the following role",
+        # LinkedIn "viewed" notifications — hiring team saw the application
+        "your application was viewed",
+        "application was viewed by",
+        "great job getting noticed by the hiring team",
+        # "Indeed Application: [Role]" subject line — apply confirmation from Indeed
+        "indeed application:",
+        # "Congratulations! Your application for [Role]" — platform apply confirmation
+        # (NOT a selection — this is just acknowledgement of submission)
+        "congratulations! your application for",
+        "congratulations, your application for",
+        # "Application Received: [Role]" — direct confirmation
+        "application received:",
     ]
     if any(p in text for p in APPLIED_PHRASES):
         return "Applied"
@@ -589,12 +810,79 @@ def extract_company_from_email(sender: str, subject: str) -> str | None:
                 return c
         return "Internshala"  # Keep platform as company name for selection tracking
 
+    # ── Darwinbox ATS: noreply@darwinbox.in — extract company from "|Company" in subject ──
+    if re.search(r"@darwinbox\.", sender, re.IGNORECASE):
+        # Subject format: "Candidate Application has been submitted successfully |CompanyName"
+        m = re.search(r"\|\s*([A-Za-z0-9][^\|\n]{1,60}?)\s*$", subject)
+        if m:
+            c = m.group(1).strip().rstrip(".,")
+            if 1 < len(c) < 60 and c.lower() not in PLATFORM_COMPANY_NAMES:
+                return c
+        # Also try "Application for [Role] at [Company]"
+        m2 = re.search(r"(?:application for .+ at|at) ([A-Za-z][^\|\n,\.]{1,60}?)(?:\s*[\|,\.]|\s*$)", subject, re.IGNORECASE)
+        if m2:
+            c = m2.group(1).strip().rstrip(".,")
+            if 1 < len(c) < 60 and c.lower() not in PLATFORM_COMPANY_NAMES:
+                return c
+        return None  # Don't fall through to "Darwinbox"
+
+    # ── Workday ATS: myworkday.com — company subdomain IS the company ──────────
+    if re.search(r"@myworkday\.com|\.myworkday\.com", sender, re.IGNORECASE):
+        # Sender: "CompanyName Recruiting <recruiting@companyname.myworkday.com>"
+        m = re.match(r'^"?([^"<@\n]+)"?\s*<', sender)
+        if m:
+            display = m.group(1).strip()
+            for suffix in [" Recruiting", " Careers", " HR", " Jobs", " Talent"]:
+                display = display.replace(suffix, "").strip()
+            if display.lower() not in PLATFORM_COMPANY_NAMES and len(display) > 1:
+                return display
+        return None
+
+    # ── Greenhouse ATS: greenhouse.io — display name or subject has company ────
+    if re.search(r"@greenhouse\.io|@greenhouse-mail\.com", sender, re.IGNORECASE):
+        # Subject: "CompanyName | Your application..." or "Thank you for your application at CompanyName"
+        m = re.match(r"(?i)^([A-Za-z][A-Za-z0-9 .&'-]{1,40}?)\s*\|", subject)
+        if m:
+            c = m.group(1).strip()
+            if 1 < len(c) < 60 and c.lower() not in PLATFORM_COMPANY_NAMES:
+                return c
+        m2 = re.search(r"(?:application at|applying to|applied to) ([A-Za-z][^\|,\.!]{1,60}?)(?:\s*[!,\|\.]|\s*$)", subject, re.IGNORECASE)
+        if m2:
+            c = m2.group(1).strip().rstrip(".,!")
+            if 1 < len(c) < 60 and c.lower() not in PLATFORM_COMPANY_NAMES:
+                return c
+        return None
+
+    # ── Lever ATS: hire.lever.co — display name usually has company ────────────
+    if re.search(r"@lever\.co|@hire\.lever\.co", sender, re.IGNORECASE):
+        m = re.match(r'^"?([^"<@\n]+)"?\s*<', sender)
+        if m:
+            display = m.group(1).strip()
+            for suffix in [" Recruiting", " Careers", " HR", " Jobs", " Talent", " Team"]:
+                display = display.replace(suffix, "").strip()
+            if display.lower() not in PLATFORM_COMPANY_NAMES and len(display) > 1:
+                return display
+        return None
+
+    # ── Handshake: joinhandshake.com — common for US university students ────────
+    if re.search(r"@joinhandshake\.com", sender, re.IGNORECASE):
+        m = re.search(r"(?:from|at|with) ([A-Za-z][^\|,\.!]{1,60}?)(?:\s*[!,\|\.]|\s*$)", subject, re.IGNORECASE)
+        if m:
+            c = m.group(1).strip().rstrip(".,!")
+            if 1 < len(c) < 60 and c.lower() not in PLATFORM_COMPANY_NAMES:
+                return c
+        return None
+
     # ── Indeed: display name IS the company, sender is noreply@indeed.com ────
     # e.g. "Twite AI Technologies <noreply@indeed.com>"
     # Block job alert senders: donotreply@jobalert.indeed.com, alert@indeed.com
     if re.search(r"@indeed\.com|@jobalert\.indeed\.com", sender, re.IGNORECASE):
         # Block job alert senders explicitly
         if re.search(r"(jobalert|alert@indeed|donotreply)", sender, re.IGNORECASE):
+            return None
+        # "Indeed Application: [Role]" emails — sender display is "Indeed Apply", not a company
+        # These are apply-confirmation emails; skip them (no real company to extract)
+        if re.search(r"^indeed application:", subject, re.IGNORECASE):
             return None
         m = re.match(r'^"?([^"<@\n]+)"?\s*<', sender)
         if m:
@@ -636,7 +924,18 @@ def extract_company_from_email(sender: str, subject: str) -> str | None:
         r"@[\w\.\-]*(recooty|breezy|smartrecruiters|recruitee|jobvite|icims|taleo"
         r"|successfactors|bamboohr|pinpoint|ashbyhq|rippling|dover|teamtailor"
         r"|comeet|freshteam|zohorecruit|occupop|jazzhr|jobsoid|betterteam"
-        r"|manatal|recruitly|innovexis|optimspace)[\w\.\-]*\.",
+        r"|manatal|recruitly|innovexis|optimspace"
+        # Global ATS platforms
+        r"|workable|workday|myworkday|oracle|oraclecloud|oraclehcm"
+        r"|keka|kekahr|darwinbox|greythr|sumhr|zoho|zohorecruitment"
+        r"|hibob|personio|factorial|recruitcee|greenhouse|lever|jazz"
+        r"|jobscore|jobsoid|jobsync|jobvite|breezyhr|applytojob"
+        r"|recruitingbypaycor|paycor|adp|adpvantage|kronos|ultipro"
+        r"|sap|sapsuccessfactors|oraclehire|beamery|hirevue|codility"
+        r"|hackerrank|hackerearth|mettl|mercer|mymettl|hackerrank|devskiller"
+        r"|vervoe|testgorilla|skillsignal|criteria|criteria-corp|hiretrue"
+        r"|jobteaser|wayup|handshake|joinhandshake|chegg|glassdoor"
+        r"|wellfound|angelist|ycombinator|workatastartup)[\w\.\-]*\.",
         re.IGNORECASE
     )
     if ATS_SENDER_PATTERN.search(sender):
@@ -687,6 +986,42 @@ def extract_company_from_email(sender: str, subject: str) -> str | None:
     if m:
         c = m.group(1).strip().rstrip(".,")
         if 1 < len(c) < 60:
+            return c
+
+    # Darwinbox ATS: "Candidate Application has been submitted successfully |CompanyName"
+    # Also handles: "Application submitted |CompanyName" or "[anything] |CompanyName"
+    m = re.search(r"\|\s*([A-Za-z0-9][^\|\n]{1,60}?)\s*$", subject)
+    if m:
+        c = m.group(1).strip().rstrip(".,")
+        if 1 < len(c) < 60 and c.lower() not in PLATFORM_COMPANY_NAMES:
+            return c
+
+    # Darwinbox ATS: "Candidate Application has been submitted successfully |Godigit"
+    if re.search(r"(candidate application|application submitted|submitted successfully)", subject, re.IGNORECASE):
+        # Also try extracting from body via sender name
+        sender_match = re.match(r'^"?([^"<@\n]+)"?\s*<', sender)
+        if sender_match:
+            display = sender_match.group(1).strip()
+            if display.lower() not in PLATFORM_COMPANY_NAMES and len(display) > 1:
+                return display
+
+    # "Indeed Application: [Role]" — from indeedapply@indeed.com
+    # Company not in subject for these, extract from sender display name
+    if re.search(r"^indeed application:", subject, re.IGNORECASE):
+        sender_match = re.match(r'^"?([^"<@\n]+)"?\s*<', sender)
+        if sender_match:
+            display = sender_match.group(1).strip()
+            if display.lower() not in PLATFORM_COMPANY_NAMES and len(display) > 1:
+                return display
+
+    # "Your application was viewed by [Company]" — LinkedIn viewed notification
+    m = re.search(
+        r"(?:application was viewed by|viewed by) ([A-Za-z0-9][^\-\n,\.]{1,60}?)(?:\s*[\-,\|]|\s*$|\.|,)",
+        subject, re.IGNORECASE
+    )
+    if m:
+        c = m.group(1).strip().rstrip(".,")
+        if 1 < len(c) < 60 and c.lower() not in PLATFORM_COMPANY_NAMES:
             return c
 
     # "Thank you for applying to [Company]"
@@ -745,15 +1080,57 @@ def extract_company_from_email(sender: str, subject: str) -> str | None:
         # These are always marketing/mentor emails, never real hiring companies
         if re.match(r'^[A-Za-z]+ from [A-Za-z]', display.strip()):
             return None
+        # Words that look like person names (single capitalized word) but are actually companies/platforms
+        NOT_A_PERSON = {
+            "careers", "internshala", "wellfound", "naukri", "unstop",
+            "linkedin", "indeed", "glassdoor", "foundit", "cutshort",
+            "microsoft", "google", "amazon", "apple", "oracle",
+            "infosys", "wipro", "accenture", "deloitte", "capgemini",
+            "cognizant", "ibm", "payu", "razorpay", "cashfree", "juspay",
+            "phonepe", "freshworks", "zoho", "swiggy", "zomato", "flipkart",
+            "meesho", "cred", "groww", "zerodha", "upstox", "slice",
+        }
+        # Check if the first word of display name is a known company/brand
+        # "Microsoft Careers" → first_word="microsoft" → NOT a person
+        first_word = display.strip().split()[0].lower() if display.strip() else ""
         looks_like_person = bool(
-            re.match(r'^[A-Z][a-z]+ [A-Z][a-z]+$', display.strip()) or
-            re.match(r'^[A-Z][a-z]+ [a-z]+$', display.strip()) or
+            # Two-word patterns that look like "First Last" — but only if first word is NOT a known brand
+            (re.match(r'^[A-Z][a-z]+ [A-Z][a-z]+$', display.strip()) and first_word not in NOT_A_PERSON) or
+            (re.match(r'^[A-Z][a-z]+ [a-z]+$', display.strip()) and first_word not in NOT_A_PERSON) or
             re.match(r'^[a-z]+ [a-z]+$', display.strip()) or
             re.match(r'^[A-Z][a-z]+,\s*[A-Z][a-z]+$', display.strip()) or
-            re.match(r'^[A-Z][a-z]+$', display.strip()) or
+            (re.match(r'^[A-Z][a-z]+$', display.strip()) and display.lower() not in NOT_A_PERSON) or
             re.match(r'^[a-z]+$', display.strip())
         )
         if display.lower() not in GENERIC and not looks_like_person:
+            # Normalize known multi-word company display names to their canonical short form
+            # e.g. "EY Talent Attraction and Acquisition" → "EY"
+            # e.g. "Ernst & Young" → "EY"
+            DISPLAY_NAME_NORMALIZATIONS = [
+                (r"^ey\b", "EY"),
+                (r"^ernst\s*&?\s*young\b", "EY"),
+                (r"^deloitte\b", "Deloitte"),
+                (r"^pwc\b", "PwC"),
+                (r"^pricewaterhousecoopers\b", "PwC"),
+                (r"^kpmg\b", "KPMG"),
+                (r"^bain\b", "Bain"),
+                (r"^mckinsey\b", "McKinsey"),
+                (r"^boston consulting\b", "BCG"),
+                (r"^bcg\b", "BCG"),
+                (r"^accenture\b", "Accenture"),
+                (r"^infosys\b", "Infosys"),
+                (r"^wipro\b", "Wipro"),
+                (r"^tata consultancy\b|^tcs\b", "TCS"),
+                (r"^microsoft\b", "Microsoft"),
+                (r"^google\b", "Google"),
+                (r"^amazon\b", "Amazon"),
+                (r"^goldman sachs\b", "Goldman Sachs"),
+                (r"^morgan stanley\b", "Morgan Stanley"),
+                (r"^jpmorgan\b|^jp morgan\b", "JPMorgan"),
+            ]
+            for pattern, normalized in DISPLAY_NAME_NORMALIZATIONS:
+                if re.match(pattern, display.strip(), re.IGNORECASE):
+                    return normalized
             for suffix in [" Careers", " Recruiting", " Recruitment", " HR",
                            " Human Resources", " Talent", " Team", " Hiring",
                            " Jobs", " Notifications", " No Reply", " noreply",
@@ -766,22 +1143,32 @@ def extract_company_from_email(sender: str, subject: str) -> str | None:
                 return display.strip()
 
     # Fall back to domain
-    m = re.search(r"@([\w\-]+)\.([\w\.\-]+)", sender)
+    # Handle deep subdomains like donotreply@email.careers.microsoft.com
+    # by scanning all domain parts from right-to-left (excluding TLD) to find
+    # the first meaningful non-generic part, e.g. "microsoft" from the above.
+    m = re.search(r"@([\w\.\-]+)", sender)
     if m:
-        subdomain = m.group(1)
-        apex = m.group(2).split(".")[0]
-        GENERIC_SUB = {"noreply", "no-reply", "donotreply", "mail", "email",
-                       "notifications", "mailer", "smtp", "bounce", "careers",
-                       "jobs", "talent", "hiring", "recruit", "info", "hello",
-                       "hr", "support", "alerts", "eu", "updates"}
-        GENERIC_APEX = {"gmail", "yahoo", "outlook", "hotmail", "rediffmail",
-                        "greenhouse", "lever", "workday", "oracle", "com", "co"}
+        full_domain = m.group(1).lower()
+        parts = full_domain.split(".")
+        # Remove TLD (last part like "com", "in", "io")
+        if len(parts) > 1:
+            parts = parts[:-1]
+        GENERIC_PARTS = {
+            "noreply", "no-reply", "donotreply", "mail", "email",
+            "notifications", "mailer", "smtp", "bounce", "careers",
+            "jobs", "talent", "hiring", "recruit", "info", "hello",
+            "hr", "support", "alerts", "eu", "updates",
+            "gmail", "yahoo", "outlook", "hotmail", "rediffmail",
+            "greenhouse", "lever", "workday", "oracle", "com", "co",
+            "www", "app", "api", "secure", "static", "cdn",
+        }
+        # Scan from right-to-left (most specific brand part is usually second-to-last)
         candidate = None
-        if subdomain in GENERIC_SUB or subdomain in GENERIC_APEX:
-            if apex not in GENERIC_APEX and len(apex) > 2:
-                candidate = apex.capitalize()
-        elif subdomain not in GENERIC_APEX and len(subdomain) > 2:
-            candidate = subdomain.capitalize()
+        for part in reversed(parts):
+            if part not in GENERIC_PARTS and len(part) > 2:
+                # Capitalize properly: "microsoft" → "Microsoft"
+                candidate = part.capitalize()
+                break
         # Never return a platform/aggregator name as a company
         if candidate and candidate.lower() not in PLATFORM_COMPANY_NAMES:
             return candidate
@@ -840,7 +1227,279 @@ def _extract_parts(part) -> tuple:
     return plain, html_raw
 
 
-def fetch_and_parse_placement_emails(credentials_dict: dict) -> list[dict]:
+def extract_role_from_text(subject: str, body: str) -> str:
+    """
+    Extract the job role from email subject + body.
+    Returns "(via Gmail)" if no role found.
+    Tries subject first (most reliable), then body.
+    """
+    import re as _re
+
+    # ── Subject patterns ──────────────────────────────────────────────────────
+    # "Indeed Application: [Role]"
+    m = _re.search(r"^indeed application:\s*(.+)$", subject, _re.IGNORECASE)
+    if m:
+        r = m.group(1).strip()
+        if 3 < len(r) < 80 and "@" not in r:
+            return r
+
+    # "Your application to [Role] at [Company]"
+    m = _re.search(r"[Yy]our application to (.+?) at [A-Z]", subject)
+    if m:
+        r = m.group(1).strip()
+        if 3 < len(r) < 80 and "@" not in r:
+            return r
+
+    # "application for [Role] at / intern / position / role"
+    m = _re.search(
+        r"[Aa]pplication for (?:the )?(.+?)(?:\s+at\s+|\s+[Ii]ntern\b|\s+[Pp]osition\b|\s+[Rr]ole\b)",
+        subject
+    )
+    if m:
+        r = m.group(1).strip().rstrip(".,")
+        if 3 < len(r) < 80 and "@" not in r:
+            return r
+
+    # "Thanks for applying for [Role]" / "Thank you for applying for [Role]"
+    m = _re.search(
+        r"[Tt]han(?:ks|k you) for applying (?:for|to) (?:the )?(.+?)(?:\s+at\s+|\s*[!,\|]|\s*$)",
+        subject
+    )
+    if m:
+        r = m.group(1).strip().rstrip("!.,")
+        if 3 < len(r) < 80 and "@" not in r:
+            return r
+
+    # ── Body patterns (only if subject gave nothing) ──────────────────────────
+    if body:
+        body_lower = body[:3000]  # Only scan first 3000 chars
+
+        # Microsoft-style: "submit your application for INTERN (Job number: 200024208)"
+        # or "application for SOFTWARE ENGINEER INTERN (Job number: ...)"
+        m = _re.search(
+            r"(?:submit(?:ting)? your application for|application for)\s+([A-Z][A-Z0-9 /\-&]{3,80}?)\s*\(Job number",
+            body, _re.IGNORECASE
+        )
+        if m:
+            r = m.group(1).strip().rstrip(".,")
+            if 3 < len(r) < 80 and "@" not in r:
+                return r.title()
+
+        # "application for [Role]" / "applied for [Role]" / "applying for [Role]"
+        m = _re.search(
+            r"(?:application for|applied for|applying for|apply for) (?:the (?:role|position) of |the )?([A-Za-z][A-Za-z0-9 /\-&]{3,70}?)(?:\s+(?:at|with|position|role|intern)\b|\s*[,\.\n])",
+            body_lower, _re.IGNORECASE
+        )
+        if m:
+            r = m.group(1).strip().rstrip(".,")
+            JUNK = {"this position", "this role", "this opportunity", "internship", "the role",
+                    "a position", "an internship", "this job", "the position"}
+            if 3 < len(r) < 80 and "@" not in r and r.lower() not in JUNK:
+                return r.title() if r.islower() else r
+
+        # "role of [Role]" / "position of [Role]"
+        m = _re.search(
+            r"(?:role of|position of|the role:|the position:)\s+([A-Za-z][A-Za-z0-9 /\-&]{3,70}?)(?:\s*[,\.\n]|$)",
+            body_lower, _re.IGNORECASE
+        )
+        if m:
+            r = m.group(1).strip().rstrip(".,")
+            if 3 < len(r) < 80 and "@" not in r:
+                return r.title() if r.islower() else r
+
+        # "[Role] at [Company]" — only if followed by a known company word
+        m = _re.search(
+            r"([A-Za-z][A-Za-z0-9 /\-&]{3,50}?)\s+(?:intern(?:ship)?|engineer|analyst|developer|consultant|associate|manager|scientist)\b",
+            body_lower[:500], _re.IGNORECASE
+        )
+        if m:
+            r = m.group(0).strip().rstrip(".,")
+            if 3 < len(r) < 80 and "@" not in r:
+                return r.title() if r.islower() else r
+
+    return "(via Gmail)"
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GEMINI-BASED EXTRACTION  (replaces all regex company/role/status extraction)
+# ─────────────────────────────────────────────────────────────────────────────
+# GROQ-BASED EXTRACTION  (free, fast, no quota sharing with ai_placement)
+# Get your free key at: https://console.groq.com
+# Free tier: 14,400 req/day, 30 req/min — more than enough for PlaceWise
+# ─────────────────────────────────────────────────────────────────────────────
+
+LLM_PROMPT = """You are a placement email classifier for a university student's job application tracker.
+
+Given an email, return a JSON object with EXACTLY these fields:
+
+{
+  "is_job_email": true,
+  "company": "Exact hiring company name",
+  "role": "Exact job title",
+  "status": "Applied"
+}
+
+RULES:
+
+1. is_job_email = true ONLY for real job/internship application emails.
+   Set false for: newsletters, course enrollments, bootcamp ads, job alert digests,
+   LinkedIn connection invites, EdTech promotions, portal signup confirmations,
+   hackathon invites, webinar invites, discount offers.
+
+2. company = the actual EMPLOYER, not the portal or ATS platform.
+   - LinkedIn, Indeed, Greenhouse, Lever, Workday, Unstop, Internshala, Recooty, BambooHR are NOT companies — they are platforms.
+   - "EY Talent Attraction" → "EY"
+   - "Microsoft Careers" → "Microsoft"
+   - "Amazon Jobs" → "Amazon"
+   - For "your application was sent to [Company]" → [Company] is the answer.
+   - For "your application to [Role] at [Company]" → [Company] is the answer.
+
+3. role = the specific job title. Extract from subject or body.
+   Examples: "Software Engineer Intern", "Data Analyst", "Data Science Intern"
+   For Microsoft emails, search body for "application for [ROLE] (Job number:" pattern.
+   If unknown, use "(via Gmail)".
+
+4. status must be EXACTLY one of these five values:
+   - "Applied" — application received/submitted/confirmed. Use for:
+     * "Thank you for your application" (ALWAYS Applied, even from Microsoft)
+     * "Your application was sent to..."
+     * "We received your application"
+     * "Keep track of your application"
+     * "Thank you for applying"
+     * "Your application was viewed by [Company]" — hiring team viewed your application, still Applied
+     * "Great job getting noticed by the hiring team" — still Applied
+     * Any body text saying "if you are selected" or "if selected for interview" — this is FUTURE CONDITIONAL, not a selection. Still Applied.
+   - "OA Received" — online assessment/coding test invitation
+   - "Interview Scheduled" — confirmed interview invite or shortlisted for interview
+   - "Selected" — ONLY for actual job/internship OFFER with offer letter, joining date, or stipend.
+     NEVER use Selected for: thank you emails, shortlisting for interview, bootcamp enrollment, EdTech programs, hackathon results
+   - "Rejected" — not moving forward, unfortunately, regret to inform
+
+5. If is_job_email is false → set company, role, status all to null.
+
+CRITICAL EXAMPLES:
+- Subject "Thank you for your application!" from Microsoft → is_job_email:true, status:"Applied"
+- Subject "Your application was sent to Cashfree Payments" → status:"Applied"
+- Subject "Thanks for applying at EY" → status:"Applied", company:"EY"
+- Subject "Your application was viewed by 72 Dragons" → is_job_email:true, status:"Applied", company:"72 Dragons"
+- Subject "Your application was viewed by Cashfree" → is_job_email:true, status:"Applied", company:"Cashfree"
+- Subject "Candidate Application has been submitted successfully |Godigit" → is_job_email:true, status:"Applied", company:"Godigit"
+- Subject "Indeed Application: Data Science Intern" → is_job_email:true, status:"Applied", role:"Data Science Intern"
+- Subject "Indeed Application: Machine Learning Intern" → is_job_email:true, status:"Applied", role:"Machine Learning Intern"
+- Subject "You are invited to complete an online assessment" → status:"OA Received"
+- Subject "You have been shortlisted for an interview" → status:"Interview Scheduled"
+- Subject "We are pleased to offer you the role" → status:"Selected"
+- Subject "Unfortunately, we will not be moving forward" → status:"Rejected"
+- Subject "LeetCode Weekly Contest" → is_job_email:false
+- Subject "Invitation to join our bootcamp" → is_job_email:false
+- Subject "John accepted your invitation, explore their network" → is_job_email:false
+
+Return ONLY the JSON object. No markdown, no explanation, no extra text.
+"""
+
+
+def claude_extract_email_info(sender: str, subject: str, body: str) -> dict | None:
+    """
+    Use Claude Haiku (Anthropic) to extract company, role, and status.
+    Cost: ~₹0.033 per email (~₹20 for full 624-email sync).
+    Most accurate option — ~97% classification accuracy.
+    Returns dict with keys: is_job_email, company, role, status
+    Returns None if key missing or call fails.
+    """
+    api_key = _get_anthropic_key()
+    if not api_key:
+        return None
+
+    body_snippet = (body or "")[:1500].strip()
+    user_content = f"Sender: {sender}\nSubject: {subject}\nBody:\n{body_snippet}"
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 200,
+        "system": LLM_PROMPT,
+        "messages": [{"role": "user", "content": user_content}],
+    }
+
+    for attempt in range(3):
+        try:
+            resp = httpx.post(ANTHROPIC_API_URL, headers=headers, json=payload, timeout=15)
+            if resp.status_code == 429:
+                wait = 10 * (attempt + 1)
+                print(f"[CLAUDE 429] Rate limit, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            raw = resp.json()["content"][0]["text"].strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+            data = json.loads(raw)
+            return data
+        except Exception as e:
+            print(f"[CLAUDE ERROR] {str(e)[:100]}")
+            return None
+
+    return None
+
+
+def groq_extract_email_info(sender: str, subject: str, body: str) -> dict | None:
+    """
+    Use Groq (Llama 3.1) to extract company, role, and status from a job email.
+    Groq free tier: 14,400 req/day, 30 req/min — no quota sharing issues.
+    Returns dict with keys: is_job_email, company, role, status
+    Returns None if Groq key missing or call fails.
+    """
+    api_key = _get_groq_key()
+    if not api_key:
+        return None
+
+    body_snippet = (body or "")[:1500].strip()
+    user_content = f"Sender: {sender}\nSubject: {subject}\nBody:\n{body_snippet}"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": LLM_PROMPT},
+            {"role": "user",   "content": user_content},
+        ],
+        "temperature": 0,
+        "max_tokens": 200,
+        "response_format": {"type": "json_object"},
+    }
+
+    for attempt in range(3):
+        try:
+            _groq_rate_limit()   # enforce 2.1s gap between calls — stay under 30 req/min
+            resp = httpx.post(GROQ_API_URL, headers=headers, json=payload, timeout=15)
+            if resp.status_code == 429:
+                wait = 10 * (attempt + 1)
+                print(f"[GROQ 429] Rate limit, waiting {wait}s (attempt {attempt+1}/3)...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+            data = json.loads(raw)
+            return data
+        except Exception as e:
+            print(f"[GROQ ERROR] {str(e)[:100]}")
+            return None
+
+    print("[GROQ ERROR] All retries exhausted — falling back to regex")
+    return None
+
+
+def fetch_and_parse_placement_emails(credentials_dict: dict, seen_message_ids: set[str] | None = None) -> list[dict]:
     from datetime import datetime, timezone
 
     creds = Credentials(
@@ -909,7 +1568,27 @@ def fetch_and_parse_placement_emails(credentials_dict: dict) -> list[dict]:
             'subject:"thanks from" OR '
             'subject:"received your job application" OR '
             'subject:"we have received your job" OR '
-            'subject:"submitting your profile"'
+            'subject:"submitting your profile" OR '
+            'subject:"submitted successfully" OR '
+            'subject:"candidate application" OR '
+            'subject:"application submitted" OR '
+            'subject:"application has been submitted" OR '
+            'subject:"indeed application" OR '
+            'subject:"application for the" OR '
+            'subject:"your application for" OR '
+            'subject:"thanks for applying" OR '
+            'subject:"received your application" OR '
+            'subject:"application status update" OR '
+            'subject:"your candidature" OR '
+            'subject:"your candidacy" OR '
+            'subject:"you have been shortlisted" OR '
+            'subject:"we have shortlisted" OR '
+            'subject:"next steps for your application" OR '
+            'subject:"offer of employment" OR '
+            'subject:"job offer" OR '
+            'subject:"position has been filled" OR '
+            'subject:"your recent application" OR '
+            'subject:"application update"'
             ") "
             # NOTE: intentionally NOT filtering -category:promotions here.
             # LinkedIn rejection emails ("Your update from X", "Your application to X at Y")
@@ -1049,154 +1728,282 @@ def fetch_and_parse_placement_emails(credentials_dict: dict) -> list[dict]:
                 else:
                     raise
 
+    # ── Per-email processing ─────────────────────────────────────────────────
+    # ARCHITECTURE: Groq LLM-first with regex fallback
+    #   1. is_promotional_email() → fast local filter, skips obvious spam (free)
+    #   2. regex fast-path → if regex gives clear status+company, skip LLM entirely
+    #   3. groq_extract_email_info() → LLM-based extraction for ambiguous emails
+    #   4. regex fallback → if Groq unavailable or fails
+    # Groq: free 14,400 req/day, 30 req/min, no quota sharing with ai_placement.
+
+    anthropic_available = _get_anthropic_key() is not None
+    groq_available      = _get_groq_key() is not None
+
+    if anthropic_available:
+        print("[gmail_parser] Claude Haiku (Anthropic) extraction enabled ✅ (~₹2/month)")
+    elif groq_available:
+        print("[gmail_parser] Groq (Llama 3.3-70b) extraction enabled ✅ (free)")
+    else:
+        print("[gmail_parser] No LLM key — using regex fallback ⚠️ (add ANTHROPIC_API_KEY or GROQ_API_KEY)")
+
+    def _deep_extract(payload):
+        """Recursively extract all text from MIME parts."""
+        result = ""
+        for part in payload.get("parts", []):
+            mime = part.get("mimeType", "")
+            data = part.get("body", {}).get("data", "")
+            if data and ("plain" in mime or "html" in mime):
+                decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                if "html" in mime:
+                    decoded = re.sub(r'<[^>]+>', ' ', decoded)
+                    decoded = re.sub(r'&nbsp;', ' ', decoded)
+                    decoded = re.sub(r'&amp;', '&', decoded)
+                    decoded = re.sub(r'&#\d+;', ' ', decoded)
+                    decoded = re.sub(r'\s+', ' ', decoded).strip()
+                result += " " + decoded
+            result += _deep_extract(part)
+        return result
+
+    _seen = seen_message_ids or set()
+
     for msg_ref in messages:
         try:
+            # ── Fast skip: already in DB ──────────────────────────────────────
+            if msg_ref["id"] in _seen:
+                continue
+
             msg = fetch_message_with_retry(msg_ref["id"])
 
-            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-            subject = headers.get("Subject", "")
-            sender  = headers.get("From", "")
-            snippet = msg.get("snippet", "")
-            body    = get_email_body(msg["payload"])
-
-            # Always combine body + snippet for maximum rejection phrase coverage
+            headers  = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            subject  = headers.get("Subject", "")
+            sender   = headers.get("From", "")
+            snippet  = msg.get("snippet", "")
+            body     = get_email_body(msg["payload"])
             full_text = body + " " + snippet
 
             internal_ms = int(msg.get("internalDate", 0))
-            email_date = datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc) if internal_ms else None
+            email_date  = datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc) if internal_ms else None
 
+            # ── Stage 1: Spam filter (fast, local, no API call) ──────────────
             if is_promotional_email(sender, subject):
                 print(f"[SKIP promo] {sender[:40]} | {subject[:50]}")
                 continue
 
-            is_job_platform = (
-                "linkedin" in sender.lower() or
-                "indeed" in sender.lower() or
-                "unstop" in sender.lower()
-            )
-
-            # For LinkedIn/Indeed/Unstop: ALWAYS do deep MIME extraction.
-            # Their HTML emails often produce 100-500 chars of navigation junk from
-            # get_email_body(), hiding the actual rejection phrase. Deep extract gets all parts.
-            def _deep_extract(payload):
-                result = ""
-                for part in payload.get("parts", []):
-                    mime = part.get("mimeType", "")
-                    data = part.get("body", {}).get("data", "")
-                    if data and ("plain" in mime or "html" in mime):
-                        decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                        if "html" in mime:
-                            decoded = re.sub(r'<[^>]+>', ' ', decoded)
-                            decoded = re.sub(r'&nbsp;', ' ', decoded)
-                            decoded = re.sub(r'&amp;', '&', decoded)
-                            decoded = re.sub(r'&#\d+;', ' ', decoded)
-                            decoded = re.sub(r'\s+', ' ', decoded).strip()
-                        result += " " + decoded
-                    result += _deep_extract(part)
-                return result
-
-            if is_job_platform:
-                deep_text = _deep_extract(msg["payload"]).strip()
-                if deep_text:
-                    full_text = deep_text + " " + snippet
-                else:
-                    full_text = body + " " + snippet
-            elif not body.strip() or len(body.strip()) < 100:
-                # For other senders with empty/short body, try deep extract too
+            # ── Stage 2: Deep body extraction for HTML-heavy emails ──────────
+            is_job_platform = any(p in sender.lower() for p in ["linkedin", "indeed", "unstop"])
+            if is_job_platform or not body.strip() or len(body.strip()) < 100:
                 deep_text = _deep_extract(msg["payload"]).strip()
                 if deep_text:
                     full_text = deep_text + " " + snippet
 
-            # Always append snippet — it's often the most reliable readable text
             if snippet and snippet not in full_text:
                 full_text = full_text + " " + snippet
 
-            # SNIPPET FAST-PATH: For LinkedIn/Indeed, the snippet IS the rejection text.
-            # Check snippet alone first for high-confidence statuses.
-            # CRITICAL: NEVER trust "Applied" from snippet alone.
-            # LinkedIn rejection emails begin with "Thank you for your interest in [role]..."
-            # (an Applied phrase) BEFORE the "Unfortunately, we will not be moving forward"
-            # rejection text. Gmail snippets are ~200 chars and cut off before "Unfortunately",
-            # so snippet_status would return "Applied" — masking the real Rejected status.
-            # Only use snippet if it detects Rejected / Interview / Selected / OA.
-            snippet_status = None
-            if is_job_platform and snippet:
-                s = parse_email_for_status(subject, snippet)
-                if s and s != "Applied":
-                    snippet_status = s
+            # ── Stage 3: Regex fast-path — skip Groq for easy emails ────────
+            # If regex already gives us both a clear status AND a company, Groq
+            # adds no value. Only fall through to Groq for ambiguous cases.
+            company = role = status = None
+            _regex_status  = parse_email_for_status(subject, full_text)
+            _regex_company = extract_company_from_email(sender, subject)
 
-            status = snippet_status or parse_email_for_status(subject, full_text)
+            # SUBJECT-OVERRIDE: If the subject clearly signals "Applied",
+            # never let the body override it to "Selected".
+            # This fixes Microsoft "Thank you for your application!" being
+            # classified as Selected because body says "if you are selected".
+            # SUBJECT-OVERRIDE: If the subject says "thank you/applied" BUT the body
+            # only has CONDITIONAL selected phrases ("if you are selected"),
+            # override to Applied. But if the body has a DEFINITIVE acceptance
+            # ("has been accepted", "we are pleased to offer"), keep Selected.
+            APPLIED_SUBJECTS = [
+                "thank you for your application",
+                "thanks for your application",
+                "thank you for applying",
+                "thanks for applying",
+                "your application was sent",
+                "your application was received",
+                "we received your application",
+                "application received",
+                "application confirmation",
+                "keep track of your application",
+                "your application has been received",
+                "application submitted",
+            ]
+            # Definitive acceptance phrases — these mean REAL selection even in "applied" subject emails
+            DEFINITIVE_SELECTED = [
+                "has been accepted", "have been accepted", "been accepted",
+                "pleased to offer", "delighted to offer", "offer letter",
+                "joining date", "welcome aboard", "you are selected",
+                "you have been selected", "pleased to welcome",
+            ]
+            subject_lower = subject.lower()
+            full_text_lower = full_text.lower()
+            if (
+                _regex_status == "Selected"
+                and any(s in subject_lower for s in APPLIED_SUBJECTS)
+                and not any(d in full_text_lower for d in DEFINITIVE_SELECTED)
+            ):
+                _regex_status = "Applied"
+                print(f"[STATUS-OVERRIDE] Conditional selected phrase in body → forcing Applied")
 
-            # Second pass: if still no status, try subject-only classification
-            # (catches rejections where body is paywalled/blocked/empty)
+            llm_available = anthropic_available or groq_available
+
+            def _call_llm(s, sub, txt):
+                """Call Claude Haiku first, fall back to Groq."""
+                result = None
+                if anthropic_available:
+                    result = claude_extract_email_info(s, sub, txt)
+                if result is None and groq_available:
+                    result = groq_extract_email_info(s, sub, txt)
+                return result
+
+            # ── SMART ROUTING ────────────────────────────────────────────────
+            # Goal: minimise LLM calls while catching every edge case.
+            #
+            # SAFE REGEX (skip LLM):
+            #   • Strong status: Rejected / OA Received / Interview Scheduled
+            #     → These are unambiguous. Regex is 100% reliable.
+            #   • "your application was sent to X" → definitely Applied
+            #     → LinkedIn EasyApply confirmation. Never says Selected.
+            #   • "thank you for applying to X" → definitely Applied
+            #
+            # MUST USE LLM:
+            #   • "your application to [Role] at [Company]" — LinkedIn update email
+            #     Body might say "has been accepted" (Selected) or just "applied"
+            #   • "your update from [Company]" — could be any status
+            #   • No regex company found at all → LLM needed for extraction
+            #   • No regex status found at all → LLM needed
+
+            SAFE_APPLIED_SUBJECTS = [
+                "your application was sent to",
+                "thank you for applying to",
+                "thanks for applying to",
+                "thank you for applying at",
+                "thanks for applying at",
+                "thank you for your application",
+                "thanks for your application",
+                "we received your application",
+                "application received",
+                "application confirmation",
+                "keep track of your application",
+                "application submitted",
+                "your application has been received",
+                # Darwinbox ATS — "Candidate Application has been submitted successfully |CompanyName"
+                "candidate application has been submitted",
+                "application has been submitted successfully",
+                "submitted successfully",
+                # Indeed — "Indeed Application: [Role]"
+                "indeed application:",
+                # Generic ATS confirmation patterns
+                "your application for the",
+                "application for the",
+                "your application has been submitted",
+            ]
+
+            AMBIGUOUS_SUBJECTS = [
+                "your application to",       # Zetheta case — could be Applied OR Selected
+                "your update from",          # LinkedIn update — could be any status
+                "application update",        # generic update
+                "update on your application",
+                "regarding your application",
+            ]
+
+            subject_lower_r = subject.lower()
+            is_safe_applied = any(s in subject_lower_r for s in SAFE_APPLIED_SUBJECTS)
+            is_ambiguous    = any(s in subject_lower_r for s in AMBIGUOUS_SUBJECTS)
+
+            company = role = status = None
+
+            # Path A: Strong regex status → trust regex, skip LLM
+            STRONG_STATUSES = {"Rejected", "Interview Scheduled", "OA Received", "Selected"}
+            if _regex_status in STRONG_STATUSES and _regex_company:
+                company = _regex_company
+                status  = _regex_status
+                role    = extract_role_from_text(subject, full_text)
+                print(f"[REGEX-HIT] {company} | {status} | {subject[:50]}")
+
+            # Path B: Safe Applied subject + company found → trust regex, skip LLM
+            elif is_safe_applied and _regex_company and not is_ambiguous:
+                company = _regex_company
+                status  = "Applied"
+                role    = extract_role_from_text(subject, full_text)
+                print(f"[REGEX-HIT] {company} | Applied | {subject[:50]}")
+
+            # Path C: Ambiguous subject OR no company/status → use LLM
+            elif llm_available and (is_ambiguous or not _regex_company or not _regex_status):
+                result = _call_llm(sender, subject, full_text)
+                if result and result.get("is_job_email"):
+                    company = result.get("company") or _regex_company or None
+                    role    = result.get("role") or "(via Gmail)"
+                    status  = result.get("status") or None
+                    VALID   = {"Applied", "OA Received", "Interview Scheduled", "Selected", "Rejected"}
+                    if status not in VALID:
+                        status = None
+                    tag = "CLAUDE" if anthropic_available else "GROQ"
+                    if company:
+                        print(f"[{tag}] {company} | {status} | {role[:40]}")
+                elif result and result.get("is_job_email") is False:
+                    tag = "CLAUDE" if anthropic_available else "GROQ"
+                    print(f"[{tag}-SKIP] Not a job email: {subject[:60]}")
+                    continue
+
+            # Path D: Has regex result but no LLM — use regex as-is
+            elif _regex_status and _regex_company:
+                company = _regex_company
+                status  = _regex_status
+                role    = extract_role_from_text(subject, full_text)
+                print(f"[REGEX-HIT] {company} | {status} | {subject[:50]}")
+
+            # ── Stage 5: Pure regex fallback (Gemini unavailable or errored) ──
             if not status:
-                status = parse_email_for_status(subject, "")
-
-            if not status:
-                # Extra debug for "update from" / Indeed emails that should have rejection status
-                if "update from" in subject.lower() or "update on your application" in subject.lower():
-                    body_preview = full_text[:300].replace("\n", " ")
-                    print(f"[SKIP no-match][update-debug] subject={subject[:60]}")
-                    print(f"  sender={sender[:50]}")
-                    print(f"  body_preview: {body_preview[:200]}")
-                else:
+                # Reuse already-computed regex values; try snippet fast-path for job platforms
+                snippet_status = None
+                if is_job_platform and snippet:
+                    s = parse_email_for_status(subject, snippet)
+                    if s and s != "Applied":
+                        snippet_status = s
+                status = snippet_status or _regex_status or parse_email_for_status(subject, "")
+                if not status:
                     print(f"[SKIP no-match] {subject[:60]}")
-                continue
+                    continue
 
-            company = extract_company_from_email(sender, subject)
-
-            # Unstop fallback: company name is in the body, not subject/sender
-            # Body pattern: "the [Company] has decided to move on with other candidates"
-            if not company and any(d in sender.lower() for d in ["unstop.com", "unstop.email", "unstop.events"]):
-                # Rejection pattern
-                m = re.search(
-                    r"(?:the\s+)?([A-Z][A-Za-z0-9 &\.]{1,60}?)\s+has decided to move",
-                    full_text
-                )
-                if m:
-                    c = m.group(1).strip()
-                    if c.lower() not in PLATFORM_COMPANY_NAMES and 1 < len(c) < 60:
-                        company = c
-                if not company:
-                    # Accepted pattern: "your application to [Company] has been accepted"
-                    m2 = re.search(
-                        r"(?:application to|application for .+ at|at) ([A-Z][A-Za-z0-9 &\.]{1,60}?) (?:has been accepted|have accepted|is accepted)",
-                        full_text
-                    )
-                    if m2:
-                        c = m2.group(1).strip()
-                        if c.lower() not in PLATFORM_COMPANY_NAMES and 1 < len(c) < 60:
-                            company = c
-                if not company:
-                    # Generic fallback: "[Company] has decided not to move forward"
-                    m3 = re.search(
-                        r"([A-Z][A-Za-z0-9 &\.]{1,60}?)\s+(?:has decided|have decided|decided)",
-                        full_text
-                    )
-                    if m3:
-                        c = m3.group(1).strip()
-                        if c.lower() not in PLATFORM_COMPANY_NAMES and 1 < len(c) < 60:
-                            company = c
+            if not company:
+                company = _regex_company or extract_company_from_email(sender, subject)
+                # Unstop body fallback
+                if not company and any(d in sender.lower() for d in ["unstop.com", "unstop.email", "unstop.events"]):
+                    for pattern in [
+                        r"(?:the\s+)?([A-Z][A-Za-z0-9 &\.]{1,60}?)\s+has decided to move",
+                        r"(?:application to|at) ([A-Z][A-Za-z0-9 &\.]{1,60}?) (?:has been accepted)",
+                        r"([A-Z][A-Za-z0-9 &\.]{1,60}?)\s+(?:has decided|have decided)",
+                    ]:
+                        m = re.search(pattern, full_text)
+                        if m:
+                            c = m.group(1).strip()
+                            if c.lower() not in PLATFORM_COMPANY_NAMES and 1 < len(c) < 60:
+                                company = c
+                                break
 
             if not company:
                 print(f"[SKIP no-company] {sender[:40]}")
                 continue
 
+            if not role:
+                role = extract_role_from_text(subject, full_text)
+
             print(f"[FOUND] {company} | {status} | {subject[:50]}")
             parsed_results.append({
-                "company":        company,
-                "status":         status,
-                "subject":        subject,
-                "sender":         sender,
-                "snippet":        snippet[:500],
-                "email_date":     email_date,
+                "company":          company,
+                "status":           status,
+                "role":             role,
+                "subject":          subject,
+                "sender":           sender,
+                "snippet":          snippet[:500],
+                "email_date":       email_date,
                 "gmail_message_id": msg_ref["id"],
             })
 
         except Exception as e:
             import traceback
             err_str = str(e)
-            # Log transient errors briefly, full trace for unexpected ones
             if any(x in err_str.lower() for x in ["getaddrinfo", "connection", "forcibly", "server at gmail"]):
                 print(f"[ERROR-NET] {msg_ref['id']}: {err_str[:80]}")
             else:

@@ -5,6 +5,7 @@ import tempfile
 import os
 import secrets
 import smtplib
+import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -77,11 +78,11 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    os.getenv("FRONTEND_URL", "http://localhost:5173"),
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "chrome-extension://*"
-],
+        os.getenv("FRONTEND_URL", "http://localhost:5173"),
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "chrome-extension://*"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -164,7 +165,16 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
             if not token_row:
                 return
             tokens = {"token": token_row.token, "refresh_token": token_row.refresh_token}
-            emails = fetch_and_parse_placement_emails(tokens)
+            seen_ids: set[str] = {
+                row.gmail_message_id
+                for row in _db.query(Application.gmail_message_id)
+                             .filter(
+                                 Application.user_id == uid,
+                                 Application.gmail_message_id.isnot(None)
+                             )
+                             .all()
+            }
+            emails = fetch_and_parse_placement_emails(tokens, seen_message_ids=seen_ids)
             # minimal upsert — same logic as /gmail/sync
             STATUS_RANK = {"Applied": 0, "OA Received": 1, "Interview Scheduled": 2, "Rejected": 3, "Selected": 4}
             import re as _re
@@ -172,7 +182,7 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
             for email in emails:
                 company = email.get("company"); status = email.get("status")
                 if not company or not status: continue
-                key = company.lower()
+                key = (company.lower(), email.get("subject","")[:60].lower())
                 if key not in best_per_company or STATUS_RANK.get(status,-1) > STATUS_RANK.get(best_per_company[key]["status"],-1):
                     best_per_company[key] = {"company": company, "status": status,
                                               "role": email.get("subject","")[:60],
@@ -202,7 +212,9 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
         finally:
             _db.close()
 
-    threading.Thread(target=_bg_sync, args=(existing_user.id,), daemon=True).start()
+    # AUTO-SYNC DISABLED: prevented double-sync quota exhaustion with Gemini.
+    # Re-enable after first full manual sync completes successfully.
+    # threading.Thread(target=_bg_sync, args=(existing_user.id,), daemon=True).start()
 
     return {"access_token": token, "token_type": "bearer"}
 
@@ -477,6 +489,22 @@ def _get_gmail_token_row(user_id: int, db: Session):
     return db.query(GmailToken).filter(GmailToken.user_id == user_id).first()
 
 
+def _is_token_expired_error(err_str: str) -> bool:
+    """Returns True if the error looks like an OAuth token expiry or revocation."""
+    err_lower = err_str.lower()
+    return any(x in err_lower for x in [
+        "invalid_grant",
+        "token has been expired",
+        "token has been revoked",
+        "revoked",
+        "reauth",
+        "refresh",
+        "unauthorized",
+        "invalid credentials",
+        "access_denied",
+    ])
+
+
 @app.get("/gmail/connect", tags=["Gmail"])
 def gmail_connect(
     user_id: int = Depends(get_current_user_id)
@@ -499,14 +527,14 @@ def gmail_callback(code: str, state: str):
     try:
         user_id = int(state)
         code_verifier = pending_oauth.pop(user_id, None)
-        if not code_verifier:
-            raise HTTPException(
-                status_code=400,
-                detail="OAuth session expired. Please reconnect via /gmail/connect."
-            )
+        # NOTE: code_verifier may be None for web-flow OAuth (server-side apps
+        # with a client_secret don't always use PKCE). Only set it when present.
+        # We no longer hard-fail here — Google will reject the token exchange
+        # itself if something is truly wrong, giving a clearer error.
 
         flow = get_flow()
-        flow.code_verifier = code_verifier
+        if code_verifier:
+            flow.code_verifier = code_verifier
         flow.fetch_token(code=code)
 
         creds = flow.credentials
@@ -551,17 +579,53 @@ def gmail_sync(
 ):
     """Fetch and parse placement emails, then upsert into applications table."""
 
-    # FIXED: read tokens from DB instead of in-memory dict
     token_row = _get_gmail_token_row(user_id, db)
     if not token_row:
         raise HTTPException(status_code=400, detail="Gmail not connected. Visit /gmail/connect first.")
 
+    # FIX: guard against missing refresh_token (e.g. user connected before
+    # offline access was requested, so Google never issued a refresh token)
+    if not token_row.refresh_token:
+        db.delete(token_row)
+        db.commit()
+        raise HTTPException(
+            status_code=401,
+            detail="Gmail token is incomplete (no refresh token). Please reconnect Gmail."
+        )
+
     tokens = {"token": token_row.token, "refresh_token": token_row.refresh_token}
 
+    # Collect all gmail_message_ids already in the DB for this user so the parser
+    # can skip them entirely — no LLM call, no Gmail fetch for seen emails.
+    seen_ids: set[str] = {
+        row.gmail_message_id
+        for row in db.query(Application.gmail_message_id)
+                     .filter(
+                         Application.user_id == user_id,
+                         Application.gmail_message_id.isnot(None)
+                     )
+                     .all()
+    }
+
     try:
-        emails = fetch_and_parse_placement_emails(tokens)
+        emails = fetch_and_parse_placement_emails(tokens, seen_message_ids=seen_ids)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gmail fetch failed: {str(e)}")
+        err_str = str(e)
+        # Print full traceback to uvicorn console for easier debugging
+        print(f"[gmail_sync ERROR] user_id={user_id}")
+        print(traceback.format_exc())
+
+        # FIX: if the token is expired/revoked, delete it and ask user to reconnect
+        if _is_token_expired_error(err_str):
+            db.delete(token_row)
+            db.commit()
+            raise HTTPException(
+                status_code=401,
+                detail="Gmail token expired or revoked. Please reconnect Gmail via the dashboard."
+            )
+
+        raise HTTPException(status_code=500, detail=f"Gmail fetch failed: {err_str}")
 
     created, updated, skipped, cleaned = 0, 0, 0, 0
 
@@ -598,36 +662,23 @@ def gmail_sync(
             skipped += 1
             continue
 
-        key = company.lower()
+        # Role is now extracted inside gmail_parser (from subject + body)
+        role = email.get("role") or "(via Gmail)"
+
+        # KEY FIX: dedup by (company, role) not just company
+        # This allows two different roles at the same company (e.g. two EY positions)
+        # to be tracked as separate entries instead of collapsing into one
+        key = (company.lower(), role.lower())
         current_rank = STATUS_RANK.get(status, -1)
         existing_best = best_per_company.get(key)
 
         if existing_best is None or current_rank > STATUS_RANK.get(existing_best["status"], -1):
-            subject = email.get("subject", "")
-
-            def _extract_role(subj):
-                m = _re.search(r"[Yy]our application to (.+?) at [A-Z]", subj)
-                if m:
-                    r = m.group(1).strip()
-                    if 3 < len(r) < 60 and "@" not in r:
-                        return r
-                m = _re.search(r"[Aa]pplication for (?:the )?(.+?)(?:\s+at\s+|\s+[Ii]ntern\b|\s+[Pp]osition\b|\s+[Rr]ole\b)", subj)
-                if m:
-                    r = m.group(1).strip().rstrip(".,")
-                    if 3 < len(r) < 60 and "@" not in r:
-                        return r
-                m = _re.search(r"application (?:to|for) (?:the )?([A-Za-z][A-Za-z0-9 \-\/&]{2,50}?) (?:at |position|role)", subj, _re.IGNORECASE)
-                if m:
-                    r = m.group(1).strip()
-                    if 3 < len(r) < 60 and "@" not in r:
-                        return r
-                return "(via Gmail)"
-
             best_per_company[key] = {
                 "company":    company,
                 "status":     status,
-                "role":       _extract_role(subject),
+                "role":       role,
                 "email_date": email.get("email_date"),
+                "gmail_message_id": email.get("gmail_message_id"),
             }
 
     for key, best in best_per_company.items():
@@ -693,15 +744,27 @@ def gmail_debug(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id)
 ):
-    # FIXED: reads tokens from DB
     token_row = _get_gmail_token_row(user_id, db)
     if not token_row:
         raise HTTPException(status_code=400, detail="Gmail not connected.")
 
     try:
-        emails = fetch_and_parse_placement_emails({"token": token_row.token, "refresh_token": token_row.refresh_token})
+        # debug: no seen_ids filter intentional
+        emails = fetch_and_parse_placement_emails(
+            {"token": token_row.token, "refresh_token": token_row.refresh_token}
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gmail fetch failed: {str(e)}")
+        err_str = str(e)
+        print(f"[gmail_debug ERROR] user_id={user_id}")
+        print(traceback.format_exc())
+        if _is_token_expired_error(err_str):
+            db.delete(token_row)
+            db.commit()
+            raise HTTPException(
+                status_code=401,
+                detail="Gmail token expired or revoked. Please reconnect Gmail."
+            )
+        raise HTTPException(status_code=500, detail=f"Gmail fetch failed: {err_str}")
 
     import re as _re
     STATUS_RANK = {"Applied": 0, "OA Received": 1, "Interview Scheduled": 2, "Rejected": 3, "Selected": 4}
@@ -870,4 +933,3 @@ def execute_code(payload: CodePayload):
         return {"error": "Execution timed out (5s limit)", "stdout": "", "stderr": ""}
     except Exception as e:
         return {"error": str(e), "stdout": "", "stderr": ""}
-
