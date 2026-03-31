@@ -6,10 +6,10 @@ import time
 import threading as _threading
 import httpx
 
-# ── Groq rate limiter (free tier = 30 req/min = 1 every 2s) ──────────────────
+# ── Groq rate limiter (free tier = 30 req/min, ~6000 TPM) ────────────────────
 _groq_lock      = _threading.Lock()
 _groq_last_call = 0.0
-_GROQ_MIN_GAP   = 3.0   # 3s gap = max 20 req/min, well under 30 req/min limit
+_GROQ_MIN_GAP   = 5.0   # 5s gap = max 12 req/min — safe under both RPM and TPM limits
 
 def _groq_rate_limit():
     """Block until it's safe to make another Groq API call."""
@@ -1476,14 +1476,15 @@ def groq_extract_email_info(sender: str, subject: str, body: str) -> dict | None
         "response_format": {"type": "json_object"},
     }
 
-    for attempt in range(3):
+    for attempt in range(5):
         try:
-            _groq_rate_limit()   # enforce 2.1s gap between calls — stay under 30 req/min
+            _groq_rate_limit()   # enforce 5s gap between calls — safe under RPM and TPM limits
             resp = httpx.post(GROQ_API_URL, headers=headers, json=payload, timeout=15)
             if resp.status_code == 429:
-                wait = 10 * (attempt + 1)
-                print(f"[GROQ 429] Rate limit, waiting {wait}s (attempt {attempt+1}/3)...")
-                time.sleep(wait)
+                # Use Groq's retry-after header if present — it tells us exactly how long to wait
+                retry_after = int(resp.headers.get("retry-after", 10 * (attempt + 1)))
+                print(f"[GROQ 429] Rate limit, waiting {retry_after}s (attempt {attempt+1}/5)...")
+                time.sleep(retry_after)
                 continue
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"].strip()
