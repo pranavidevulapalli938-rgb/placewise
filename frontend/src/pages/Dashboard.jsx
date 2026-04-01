@@ -258,7 +258,7 @@ function ApiErrorBanner({ error, onRetry }) {
         <p className="text-sm font-semibold text-red-400">Cannot connect to backend</p>
         <p className="text-xs text-white/40 mt-1">{error}</p>
         <p className="text-xs text-white/30 mt-1">
-          Make sure FastAPI is running: <span className="font-mono text-white/50">uvicorn main:app --reload --port 8000</span>
+          The backend may be starting up — this can take 30–60 seconds on first load.
         </p>
       </div>
       <button
@@ -313,7 +313,12 @@ export default function Dashboard() {
     } catch {}
   }
 
-  useEffect(() => { fetchApps(); fetchGmailStatus() }, [])
+  useEffect(() => {
+    fetchApps()
+    fetchGmailStatus()
+    setSearch('')
+    setStatusFilter('All')
+  }, [])
 
   const addApp = async (e) => {
     e.preventDefault()
@@ -342,8 +347,17 @@ export default function Dashboard() {
 
   const connectGmail = async () => {
     try {
+      // FIX: open blank window synchronously on click before the await,
+      // then navigate it to the OAuth URL. Browsers block window.open()
+      // called after an await because it's no longer a direct user gesture.
+      const win = window.open('', '_blank')
       const r = await API.get('/gmail/connect')
-      window.open(r.data.auth_url, '_blank')
+      if (win) {
+        win.location.href = r.data.auth_url
+      } else {
+        // Fallback if popup was blocked: redirect current tab instead
+        window.location.href = r.data.auth_url
+      }
     } catch {}
   }
 
@@ -492,13 +506,24 @@ export default function Dashboard() {
             <span className="text-xs text-white/30">{filteredApps.length} of {apps.length} total</span>
           </div>
           <div className="flex gap-2 flex-wrap">
-            <input
-              type="text"
-              placeholder="Search company or role..."
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              className="flex-1 min-w-[180px] bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-white placeholder-white/30 focus:outline-none focus:border-violet-500/50"
-            />
+            <div className="relative flex-1 min-w-[180px]">
+              <input
+                type="text"
+                placeholder="Search company or role..."
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 pr-8 text-sm text-white placeholder-white/30 focus:outline-none focus:border-violet-500/50"
+              />
+              {search && (
+                <button
+                  onClick={() => setSearch('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-white/30 hover:text-white transition-colors"
+                  title="Clear search"
+                >
+                  <X size={14} />
+                </button>
+              )}
+            </div>
             <select
               value={statusFilter}
               onChange={e => setStatusFilter(e.target.value)}
