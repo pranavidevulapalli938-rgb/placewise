@@ -9,7 +9,8 @@
     "tabs"
   ],
   "host_permissions": [
-    "http://localhost:8000/*",
+    "https://placewise-ai.onrender.com/*",
+    "https://placewise-api.onrender.com/*",
     "*://*.naukri.com/*",
     "*://*.linkedin.com/*",
     "*://*.indeed.com/*",
@@ -26,7 +27,6 @@
     {
       "matches": [
         "*://*.naukri.com/*",
-        "*://www.naukri.com/job-listings*",
         "*://*.linkedin.com/*",
         "*://*.indeed.com/*",
         "*://*.internshala.com/*",
