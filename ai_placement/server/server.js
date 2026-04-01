@@ -10,6 +10,7 @@ const app = express();
 
 // FIX: restrict CORS to known origins only (not wildcard in production)
 const allowedOrigins = [
+  'https://placewise-azure.vercel.app',   // ← ADD THIS
   process.env.FRONTEND_URL || 'http://localhost:5173',
   'http://localhost:3000',
 ];
