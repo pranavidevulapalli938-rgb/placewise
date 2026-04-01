@@ -49,9 +49,6 @@ JAVAC_PATH  = shutil.which("javac")
 # ──────────────────────────────────────────
 # GMAIL TOKEN MODEL  (persisted to DB)
 # ──────────────────────────────────────────
-# FIXED: tokens were stored in-memory (gmail_tokens dict), which meant
-# every server restart forced users to re-connect Gmail.
-# Now stored in the database so the connection survives restarts.
 
 class GmailToken(Base):
     __tablename__ = "gmail_tokens"
@@ -62,7 +59,6 @@ class GmailToken(Base):
     refresh_token = Column(String, nullable=True)
 
 
-# pending_oauth is still in-memory (it's only needed for the brief OAuth handshake)
 pending_oauth: dict = {}   # user_id -> code_verifier
 
 # ──────────────────────────────────────────
@@ -75,15 +71,13 @@ app = FastAPI(
     description="Backend for university placement tracking system"
 )
 
+# FIX: Chrome extensions cannot use wildcard origin matching like "chrome-extension://*"
+# The correct fix is to allow ALL origins with allow_origins=["*"]
+# and handle auth via Bearer token (not cookies), so allow_credentials must be False.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        os.getenv("FRONTEND_URL", "http://localhost:5173"),
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "chrome-extension://*"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -119,7 +113,7 @@ def get_current_user_id(auth: HTTPAuthorizationCredentials = Depends(security)) 
 
 @app.get("/", tags=["Health"])
 def read_root():
-    return {"message": "Placement Tracker Backend is running ✅"}
+    return {"status": "InterviewAI backend running ✅", "version": "1.0.0"}
 
 
 @app.get("/me", tags=["Auth"])
@@ -155,66 +149,6 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token(data={"user_id": existing_user.id})
-
-    # Auto-sync Gmail in background if connected (non-blocking — won't delay login)
-    import threading
-    def _bg_sync(uid: int):
-        try:
-            _db = SessionLocal()
-            token_row = _db.query(GmailToken).filter(GmailToken.user_id == uid).first()
-            if not token_row:
-                return
-            tokens = {"token": token_row.token, "refresh_token": token_row.refresh_token}
-            seen_ids: set[str] = {
-                row.gmail_message_id
-                for row in _db.query(Application.gmail_message_id)
-                             .filter(
-                                 Application.user_id == uid,
-                                 Application.gmail_message_id.isnot(None)
-                             )
-                             .all()
-            }
-            emails = fetch_and_parse_placement_emails(tokens, seen_message_ids=seen_ids)
-            # minimal upsert — same logic as /gmail/sync
-            STATUS_RANK = {"Applied": 0, "OA Received": 1, "Interview Scheduled": 2, "Rejected": 3, "Selected": 4}
-            import re as _re
-            best_per_company: dict = {}
-            for email in emails:
-                company = email.get("company"); status = email.get("status")
-                if not company or not status: continue
-                key = (company.lower(), email.get("subject","")[:60].lower())
-                if key not in best_per_company or STATUS_RANK.get(status,-1) > STATUS_RANK.get(best_per_company[key]["status"],-1):
-                    best_per_company[key] = {"company": company, "status": status,
-                                              "role": email.get("subject","")[:60],
-                                              "email_date": email.get("email_date"),
-                                              "gmail_message_id": email.get("gmail_message_id")}
-            for key, best in best_per_company.items():
-                existing = _db.query(Application).filter(
-                    Application.user_id == uid,
-                    Application.company.ilike(best["company"])
-                ).first()
-                if existing:
-                    if STATUS_RANK.get(best["status"],-1) > STATUS_RANK.get(existing.status,-1):
-                        existing.status = best["status"]
-                        _db.add(ApplicationStatusHistory(application_id=existing.id, status=best["status"]))
-                else:
-                    new_app = Application(user_id=uid, company=best["company"],
-                                          role=best["role"], status=best["status"],
-                                          applied_date=best["email_date"],
-                                          gmail_message_id=best["gmail_message_id"])
-                    _db.add(new_app)
-                    _db.flush()
-                    _db.add(ApplicationStatusHistory(application_id=new_app.id, status=best["status"]))
-            _db.commit()
-            print(f"[auto-sync] Gmail sync complete for user {uid}")
-        except Exception as e:
-            print(f"[auto-sync] Gmail sync failed for user {uid}: {e}")
-        finally:
-            _db.close()
-
-    # AUTO-SYNC DISABLED: prevented double-sync quota exhaustion with Gemini.
-    # Re-enable after first full manual sync completes successfully.
-    # threading.Thread(target=_bg_sync, args=(existing_user.id,), daemon=True).start()
 
     return {"access_token": token, "token_type": "bearer"}
 
@@ -283,7 +217,6 @@ def forgot_password(req: ForgotPasswordRequest, db: Session = Depends(get_db)):
     if not user:
         return {"message": "If that email is registered, a reset link has been sent."}
 
-    # Invalidate existing unused tokens
     db.query(PasswordResetToken).filter(
         PasswordResetToken.user_id == user.id,
         PasswordResetToken.used == False
@@ -485,36 +418,23 @@ def delete_note(
 # ──────────────────────────────────────────
 
 def _get_gmail_token_row(user_id: int, db: Session):
-    """Helper: fetch the GmailToken row for a user, or None."""
     return db.query(GmailToken).filter(GmailToken.user_id == user_id).first()
 
 
 def _is_token_expired_error(err_str: str) -> bool:
-    """Returns True if the error looks like an OAuth token expiry or revocation."""
     err_lower = err_str.lower()
     return any(x in err_lower for x in [
-        "invalid_grant",
-        "token has been expired",
-        "token has been revoked",
-        "revoked",
-        "reauth",
-        "refresh",
-        "unauthorized",
-        "invalid credentials",
-        "access_denied",
+        "invalid_grant", "token has been expired", "token has been revoked",
+        "revoked", "reauth", "refresh", "unauthorized",
+        "invalid credentials", "access_denied",
     ])
 
 
 @app.get("/gmail/connect", tags=["Gmail"])
-def gmail_connect(
-    user_id: int = Depends(get_current_user_id)
-):
-    """Step 1: Returns Google OAuth consent URL for the user to visit."""
+def gmail_connect(user_id: int = Depends(get_current_user_id)):
     flow = get_flow()
     auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        state=str(user_id)
+        access_type="offline", prompt="consent", state=str(user_id)
     )
     pending_oauth[user_id] = flow.code_verifier
     return {"auth_url": auth_url}
@@ -522,36 +442,25 @@ def gmail_connect(
 
 @app.get("/gmail/callback", tags=["Gmail"])
 def gmail_callback(code: str, state: str):
-    """Step 2: Google redirects here. Exchanges code for tokens and saves to DB."""
     db = SessionLocal()
     try:
         user_id = int(state)
         code_verifier = pending_oauth.pop(user_id, None)
-        # NOTE: code_verifier may be None for web-flow OAuth (server-side apps
-        # with a client_secret don't always use PKCE). Only set it when present.
-        # We no longer hard-fail here — Google will reject the token exchange
-        # itself if something is truly wrong, giving a clearer error.
-
         flow = get_flow()
         if code_verifier:
             flow.code_verifier = code_verifier
         flow.fetch_token(code=code)
-
         creds = flow.credentials
 
-        # FIXED: save tokens to DB instead of in-memory dict
         existing = db.query(GmailToken).filter(GmailToken.user_id == user_id).first()
         if existing:
             existing.token         = creds.token
             existing.refresh_token = creds.refresh_token
         else:
             db.add(GmailToken(
-                user_id       = user_id,
-                token         = creds.token,
-                refresh_token = creds.refresh_token,
+                user_id=user_id, token=creds.token, refresh_token=creds.refresh_token,
             ))
         db.commit()
-
         return RedirectResponse(f"{FRONTEND_URL}/dashboard?gmail=connected")
 
     except HTTPException:
@@ -563,28 +472,17 @@ def gmail_callback(code: str, state: str):
 
 
 @app.get("/gmail/status", tags=["Gmail"])
-def gmail_status(
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_current_user_id)
-):
-    """Returns whether Gmail is connected for this user. FIXED: reads from DB."""
+def gmail_status(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
     row = _get_gmail_token_row(user_id, db)
     return {"gmail_connected": row is not None}
 
 
 @app.post("/gmail/sync", tags=["Gmail"])
-def gmail_sync(
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_current_user_id)
-):
-    """Fetch and parse placement emails, then upsert into applications table."""
-
+def gmail_sync(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
     token_row = _get_gmail_token_row(user_id, db)
     if not token_row:
         raise HTTPException(status_code=400, detail="Gmail not connected. Visit /gmail/connect first.")
 
-    # FIX: guard against missing refresh_token (e.g. user connected before
-    # offline access was requested, so Google never issued a refresh token)
     if not token_row.refresh_token:
         db.delete(token_row)
         db.commit()
@@ -594,53 +492,37 @@ def gmail_sync(
         )
 
     tokens = {"token": token_row.token, "refresh_token": token_row.refresh_token}
-
-    # Collect all gmail_message_ids already in the DB for this user so the parser
-    # can skip them entirely — no LLM call, no Gmail fetch for seen emails.
     seen_ids: set[str] = {
         row.gmail_message_id
         for row in db.query(Application.gmail_message_id)
-                     .filter(
-                         Application.user_id == user_id,
-                         Application.gmail_message_id.isnot(None)
-                     )
+                     .filter(Application.user_id == user_id, Application.gmail_message_id.isnot(None))
                      .all()
     }
 
     try:
         emails = fetch_and_parse_placement_emails(tokens, seen_message_ids=seen_ids)
-
     except Exception as e:
         err_str = str(e)
-        # Print full traceback to uvicorn console for easier debugging
         print(f"[gmail_sync ERROR] user_id={user_id}")
         print(traceback.format_exc())
-
-        # FIX: if the token is expired/revoked, delete it and ask user to reconnect
         if _is_token_expired_error(err_str):
             db.delete(token_row)
             db.commit()
-            raise HTTPException(
-                status_code=401,
-                detail="Gmail token expired or revoked. Please reconnect Gmail via the dashboard."
-            )
-
+            raise HTTPException(status_code=401, detail="Gmail token expired or revoked. Please reconnect Gmail.")
         raise HTTPException(status_code=500, detail=f"Gmail fetch failed: {err_str}")
 
     created, updated, skipped, cleaned = 0, 0, 0, 0
+    STATUS_RANK = {"Applied": 0, "OA Received": 1, "Interview Scheduled": 2, "Rejected": 3, "Selected": 4}
 
     DEFINITE_JUNK = {
         "jobalert", "job alert", "job alerts", "jobalerts",
         "linkedin job alerts", "linkedin jobs",
-        "indeed apply", "indeedapply",
-        "unstop events",
+        "indeed apply", "indeedapply", "unstop events",
         "recooty", "naukricampus", "dare2compete",
         "job digest", "job alert digest",
     }
     all_gmail_apps = db.query(Application).filter(
-        Application.user_id == user_id,
-        Application.role == "(via Gmail)",
-        Application.status == "Applied"
+        Application.user_id == user_id, Application.role == "(via Gmail)", Application.status == "Applied"
     ).all()
     for app in all_gmail_apps:
         if app.company.lower().strip() in DEFINITE_JUNK:
@@ -648,48 +530,32 @@ def gmail_sync(
             cleaned += 1
     if cleaned:
         db.commit()
-        print(f"[sync] Cleaned {cleaned} junk platform entries from DB")
-
-    STATUS_RANK = {"Applied": 0, "OA Received": 1, "Interview Scheduled": 2, "Rejected": 3, "Selected": 4}
 
     import re as _re
     best_per_company: dict = {}
-
     for email in emails:
         company = email.get("company")
         status  = email.get("status")
         if not company or not status:
             skipped += 1
             continue
-
-        # Role is now extracted inside gmail_parser (from subject + body)
         role = email.get("role") or "(via Gmail)"
-
-        # KEY FIX: dedup by (company, role) not just company
-        # This allows two different roles at the same company (e.g. two EY positions)
-        # to be tracked as separate entries instead of collapsing into one
         key = (company.lower(), role.lower())
         current_rank = STATUS_RANK.get(status, -1)
         existing_best = best_per_company.get(key)
-
         if existing_best is None or current_rank > STATUS_RANK.get(existing_best["status"], -1):
             best_per_company[key] = {
-                "company":    company,
-                "status":     status,
-                "role":       role,
+                "company": company, "status": status, "role": role,
                 "email_date": email.get("email_date"),
                 "gmail_message_id": email.get("gmail_message_id"),
             }
 
     for key, best in best_per_company.items():
-        company    = best["company"]
-        status     = best["status"]
-        role       = best["role"]
-        email_date = best["email_date"]
+        company = best["company"]; status = best["status"]
+        role = best["role"]; email_date = best["email_date"]
 
         existing = db.query(Application).filter(
-            Application.user_id == user_id,
-            Application.company.ilike(company)
+            Application.user_id == user_id, Application.company.ilike(company)
         ).first()
 
         if not existing:
@@ -697,8 +563,7 @@ def gmail_sync(
             for a in db.query(Application).filter(Application.user_id == user_id).all():
                 db_prefix = a.company.rstrip("., ").lower()
                 if db_prefix == company_prefix or (
-                    db_prefix.startswith(company_prefix[:20]) and
-                    abs(len(db_prefix) - len(company_prefix)) <= 5
+                    db_prefix.startswith(company_prefix[:20]) and abs(len(db_prefix) - len(company_prefix)) <= 5
                 ):
                     existing = a
                     break
@@ -716,12 +581,8 @@ def gmail_sync(
                 skipped += 1
         else:
             new_app = Application(
-                user_id=user_id,
-                company=company,
-                role=role,
-                status=status,
-                applied_date=email_date,
-                gmail_message_id=best.get("gmail_message_id"),
+                user_id=user_id, company=company, role=role, status=status,
+                applied_date=email_date, gmail_message_id=best.get("gmail_message_id"),
             )
             db.add(new_app)
             db.flush()
@@ -730,146 +591,84 @@ def gmail_sync(
 
     db.commit()
     return {
-        "message": "Gmail sync complete",
-        "created": created,
-        "updated": updated,
-        "skipped": skipped,
-        "cleaned": cleaned,
-        "total_emails_parsed": len(emails)
+        "message": "Gmail sync complete", "created": created, "updated": updated,
+        "skipped": skipped, "cleaned": cleaned, "total_emails_parsed": len(emails)
     }
 
 
 @app.get("/gmail/debug", tags=["Gmail"])
-def gmail_debug(
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_current_user_id)
-):
+def gmail_debug(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
     token_row = _get_gmail_token_row(user_id, db)
     if not token_row:
         raise HTTPException(status_code=400, detail="Gmail not connected.")
-
     try:
-        # debug: no seen_ids filter intentional
         emails = fetch_and_parse_placement_emails(
             {"token": token_row.token, "refresh_token": token_row.refresh_token}
         )
     except Exception as e:
         err_str = str(e)
-        print(f"[gmail_debug ERROR] user_id={user_id}")
         print(traceback.format_exc())
         if _is_token_expired_error(err_str):
-            db.delete(token_row)
-            db.commit()
-            raise HTTPException(
-                status_code=401,
-                detail="Gmail token expired or revoked. Please reconnect Gmail."
-            )
+            db.delete(token_row); db.commit()
+            raise HTTPException(status_code=401, detail="Gmail token expired or revoked.")
         raise HTTPException(status_code=500, detail=f"Gmail fetch failed: {err_str}")
 
-    import re as _re
     STATUS_RANK = {"Applied": 0, "OA Received": 1, "Interview Scheduled": 2, "Rejected": 3, "Selected": 4}
     best_per_company = {}
     for email in emails:
-        company = email.get("company")
-        status  = email.get("status")
-        if not company or not status:
-            continue
+        company = email.get("company"); status = email.get("status")
+        if not company or not status: continue
         key = company.lower()
-        current_rank = STATUS_RANK.get(status, -1)
-        existing_best = best_per_company.get(key)
-        if existing_best is None or current_rank > STATUS_RANK.get(existing_best["status"], -1):
+        if key not in best_per_company or STATUS_RANK.get(status, -1) > STATUS_RANK.get(best_per_company[key]["status"], -1):
             best_per_company[key] = {"company": company, "status": status, "subject": email.get("subject", "")[:80]}
 
     results = []
     for key, best in best_per_company.items():
         existing = db.query(Application).filter(
-            Application.user_id == user_id,
-            Application.company.ilike(best["company"])
+            Application.user_id == user_id, Application.company.ilike(best["company"])
         ).first()
-        if not existing:
-            company_prefix = best["company"].rstrip("., ").lower()
-            for a in db.query(Application).filter(Application.user_id == user_id).all():
-                db_prefix = a.company.rstrip("., ").lower()
-                if db_prefix == company_prefix or (db_prefix.startswith(company_prefix[:20]) and abs(len(db_prefix) - len(company_prefix)) <= 5):
-                    existing = a
-                    break
         results.append({
-            "email_company": best["company"],
-            "email_status": best["status"],
+            "email_company": best["company"], "email_status": best["status"],
             "subject_preview": best["subject"],
             "db_match": existing.company if existing else None,
             "db_status": existing.status if existing else None,
             "would_update": (STATUS_RANK.get(best["status"], -1) > STATUS_RANK.get(existing.status if existing else "Applied", -1)) if existing else "would_create"
         })
 
-    return {
-        "total_parsed": len(emails),
-        "unique_companies": len(best_per_company),
-        "breakdown": sorted(results, key=lambda x: x["email_status"])
-    }
+    return {"total_parsed": len(emails), "unique_companies": len(best_per_company), "breakdown": sorted(results, key=lambda x: x["email_status"])}
 
 
 @app.delete("/gmail/disconnect", tags=["Gmail"])
-def gmail_disconnect(
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_current_user_id)
-):
-    """Removes stored Gmail tokens for this user from the DB."""
+def gmail_disconnect(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
     row = _get_gmail_token_row(user_id, db)
     if row:
-        db.delete(row)
-        db.commit()
+        db.delete(row); db.commit()
     return {"message": "Gmail disconnected"}
 
 
 @app.delete("/gmail/reset", tags=["Gmail"])
-def gmail_reset(
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_current_user_id)
-):
-    deleted = db.query(Application).filter(
-        Application.user_id == user_id,
-        Application.role == "(via Gmail)"
-    ).all()
+def gmail_reset(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
+    deleted = db.query(Application).filter(Application.user_id == user_id, Application.role == "(via Gmail)").all()
     count = len(deleted)
-    for app in deleted:
-        db.delete(app)
+    for app in deleted: db.delete(app)
     db.commit()
     return {"message": f"Deleted {count} Gmail-imported applications. Now click Sync Gmail."}
 
 
 @app.delete("/gmail/reset-all", tags=["Gmail"])
-def gmail_reset_all(
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_current_user_id)
-):
-    gmail_apps = db.query(Application).filter(
-        Application.user_id == user_id,
-        Application.role == "(via Gmail)"
-    ).all()
+def gmail_reset_all(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
+    gmail_apps = db.query(Application).filter(Application.user_id == user_id, Application.role == "(via Gmail)").all()
     count = len(gmail_apps)
-    for app in gmail_apps:
-        db.delete(app)
+    for app in gmail_apps: db.delete(app)
     db.commit()
-    return {
-        "message": f"Hard reset complete. Deleted {count} Gmail apps. Now Sync Gmail again.",
-        "deleted": count
-    }
+    return {"message": f"Hard reset complete. Deleted {count} Gmail apps. Now Sync Gmail again.", "deleted": count}
 
 
 @app.delete("/gmail/remove-company/{company_name}", tags=["Gmail"])
-def gmail_remove_company(
-    company_name: str,
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_current_user_id)
-):
-    apps = db.query(Application).filter(
-        Application.user_id == user_id,
-        Application.company.ilike(company_name)
-    ).all()
+def gmail_remove_company(company_name: str, db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
+    apps = db.query(Application).filter(Application.user_id == user_id, Application.company.ilike(company_name)).all()
     count = len(apps)
-    for app in apps:
-        db.delete(app)
+    for app in apps: db.delete(app)
     db.commit()
     return {"message": f"Deleted {count} application(s) for '{company_name}'."}
 
@@ -880,15 +679,10 @@ def gmail_remove_company(
 
 @app.post("/execute", tags=["Code Execution"])
 def execute_code(payload: CodePayload):
-    """
-    Safely execute Python or Java code in a sandboxed temp directory.
-    Timeout: 5 seconds. Returns stdout + stderr.
-    """
     lang = payload.language.lower()
 
     if lang not in ("python", "java"):
         raise HTTPException(status_code=400, detail="Unsupported language. Use 'python' or 'java'.")
-
     if lang == "python" and not PYTHON_PATH:
         raise HTTPException(status_code=500, detail="Python interpreter not found on server.")
     if lang == "java" and (not JAVA_PATH or not JAVAC_PATH):
@@ -896,16 +690,12 @@ def execute_code(payload: CodePayload):
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-
             if lang == "python":
                 file_path = os.path.join(tmpdir, "script.py")
                 with open(file_path, "w") as f:
                     f.write(payload.code)
-
                 result = subprocess.run(
-                    [PYTHON_PATH, file_path],
-                    capture_output=True, text=True, timeout=5,
-                    cwd=tmpdir
+                    [PYTHON_PATH, file_path], capture_output=True, text=True, timeout=5, cwd=tmpdir
                 )
                 return {"stdout": result.stdout, "stderr": result.stderr}
 
@@ -913,19 +703,13 @@ def execute_code(payload: CodePayload):
                 file_path = os.path.join(tmpdir, "Main.java")
                 with open(file_path, "w") as f:
                     f.write(payload.code)
-
                 compile_result = subprocess.run(
-                    [JAVAC_PATH, file_path],
-                    capture_output=True, text=True, timeout=10,
-                    cwd=tmpdir
+                    [JAVAC_PATH, file_path], capture_output=True, text=True, timeout=10, cwd=tmpdir
                 )
                 if compile_result.returncode != 0:
                     return {"compile_error": compile_result.stderr, "stdout": "", "stderr": ""}
-
                 run_result = subprocess.run(
-                    [JAVA_PATH, "-cp", tmpdir, "Main"],
-                    capture_output=True, text=True, timeout=5,
-                    cwd=tmpdir
+                    [JAVA_PATH, "-cp", tmpdir, "Main"], capture_output=True, text=True, timeout=5, cwd=tmpdir
                 )
                 return {"stdout": run_result.stdout, "stderr": run_result.stderr}
 
