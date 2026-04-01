@@ -77,7 +77,7 @@ app = FastAPI(
 # and handle auth via Bearer token (not cookies), so allow_credentials must be False.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://placewise-azure.vercel.app"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
