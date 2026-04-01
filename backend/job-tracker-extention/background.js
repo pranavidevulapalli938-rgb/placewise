@@ -1,4 +1,4 @@
-const BACKEND_URL = "https://placewise-ai.onrender.com"; // ← update to your Render URL
+const BACKEND_URL = "https://placewise-api.onrender.com"; // ← update to your Render URL
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "SEND_TO_BACKEND") {
