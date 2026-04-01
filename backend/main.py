@@ -58,8 +58,9 @@ class GmailToken(Base):
     token         = Column(String, nullable=True)
     refresh_token = Column(String, nullable=True)
 
-
-pending_oauth: dict = {}   # user_id -> code_verifier
+# NOTE: pending_oauth dict removed — it was in-memory and wiped on every
+# Render spin-down, causing "invalid_grant: Invalid code verifier" errors.
+# PKCE is optional for server-side OAuth and has been removed entirely.
 
 # ──────────────────────────────────────────
 # APP SETUP
@@ -203,7 +204,8 @@ If you didn't request this, you can safely ignore this email.
     msg.attach(MIMEText(text_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
+    # FIX: added timeout=10 so a bad SMTP config fails fast instead of hanging forever
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
         server.starttls()
         server.login(smtp_user, smtp_pass)
         server.sendmail(smtp_from, to_email, msg.as_string())
@@ -432,23 +434,25 @@ def _is_token_expired_error(err_str: str) -> bool:
 
 @app.get("/gmail/connect", tags=["Gmail"])
 def gmail_connect(user_id: int = Depends(get_current_user_id)):
+    # FIX: removed PKCE (code_verifier) — it was stored in-memory via pending_oauth
+    # dict which gets wiped on every Render spin-down, causing "invalid_grant:
+    # Invalid code verifier" errors. PKCE is optional for server-side OAuth flows.
     flow = get_flow()
     auth_url, _ = flow.authorization_url(
-        access_type="offline", prompt="consent", state=str(user_id)
+        access_type="offline",
+        prompt="consent",
+        state=str(user_id)
     )
-    pending_oauth[user_id] = flow.code_verifier
     return {"auth_url": auth_url}
 
 
 @app.get("/gmail/callback", tags=["Gmail"])
 def gmail_callback(code: str, state: str):
+    # FIX: removed pending_oauth.pop() and flow.code_verifier — no longer using PKCE
     db = SessionLocal()
     try:
         user_id = int(state)
-        code_verifier = pending_oauth.pop(user_id, None)
         flow = get_flow()
-        if code_verifier:
-            flow.code_verifier = code_verifier
         flow.fetch_token(code=code)
         creds = flow.credentials
 
@@ -458,7 +462,9 @@ def gmail_callback(code: str, state: str):
             existing.refresh_token = creds.refresh_token
         else:
             db.add(GmailToken(
-                user_id=user_id, token=creds.token, refresh_token=creds.refresh_token,
+                user_id=user_id,
+                token=creds.token,
+                refresh_token=creds.refresh_token,
             ))
         db.commit()
         return RedirectResponse(f"{FRONTEND_URL}/dashboard?gmail=connected")
@@ -473,8 +479,12 @@ def gmail_callback(code: str, state: str):
 
 @app.get("/gmail/status", tags=["Gmail"])
 def gmail_status(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
+    # FIX: only report connected if we actually have a refresh token stored.
+    # Previously this returned connected=true even after token expiry/deletion,
+    # causing the dashboard to show "Sync Gmail" instead of "Connect Gmail".
     row = _get_gmail_token_row(user_id, db)
-    return {"gmail_connected": row is not None}
+    connected = row is not None and bool(row.refresh_token)
+    return {"gmail_connected": connected}
 
 
 @app.post("/gmail/sync", tags=["Gmail"])
