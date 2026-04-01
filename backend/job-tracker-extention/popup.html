@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { width: 300px; padding: 15px; font-family: sans-serif; }
+    .hidden { display: none; }
+    input { width: 100%; margin-bottom: 10px; padding: 8px; box-sizing: border-box; }
+    button { width: 100%; padding: 10px; cursor: pointer; background: #4285f4; color: white; border: none; border-radius: 4px; }
+    .status { margin-top: 10px; font-size: 0.9em; text-align: center; }
+    #logoutBtn { background: #f44336; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h2>Placement Tracker</h2>
+
+  <div id="loginSection">
+    <input type="email" id="emailInput" placeholder="Email">
+    <input type="password" id="passInput" placeholder="Password">
+    <button id="loginBtn">Login</button>
+  </div>
+
+  <div id="trackerSection" class="hidden">
+    <p><strong>Job:</strong> <span id="jobTitle">Loading...</span></p>
+    <p><strong>Company:</strong> <span id="jobCompany">...</span></p>
+    <button id="sendBtn" disabled>Save Job</button>
+    <button id="logoutBtn">Logout</button>
+  </div>
+
+  <div id="status" class="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
