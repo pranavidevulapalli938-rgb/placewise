@@ -12,7 +12,6 @@ from email.mime.multipart import MIMEMultipart
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import Column, Integer, String, ForeignKey, Boolean, DateTime
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
@@ -72,16 +71,45 @@ app = FastAPI(
     description="Backend for university placement tracking system"
 )
 
-# FIX: Chrome extensions cannot use wildcard origin matching like "chrome-extension://*"
-# The correct fix is to allow ALL origins with allow_origins=["*"]
-# and handle auth via Bearer token (not cookies), so allow_credentials must be False.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://placewise-azure.vercel.app"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+ALLOWED_ORIGINS = [
+    "https://placewise-azure.vercel.app",   # Vercel frontend
+    "http://localhost:5173",                 # Local dev
+    "http://localhost:3000",                 # Local dev (alt port)
+]
+
+# Custom CORS middleware that also allows chrome-extension:// origins.
+# We cannot use allow_origins=["*"] with allow_credentials=True, but since
+# we use Bearer tokens (not cookies), credentials=False + explicit origins is correct.
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
+
+class FlexibleCORSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        origin = request.headers.get("origin", "")
+        # Allow: known origins + any chrome-extension://* origin
+        is_allowed = (
+            origin in ALLOWED_ORIGINS
+            or origin.startswith("chrome-extension://")
+            or origin.startswith("moz-extension://")  # Firefox extension support
+        )
+        if request.method == "OPTIONS":
+            response = StarletteResponse()
+            if is_allowed:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+            return response
+
+        response = await call_next(request)
+        if is_allowed:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        return response
+
+app.add_middleware(FlexibleCORSMiddleware)
 
 # Create all DB tables on startup (including the new gmail_tokens table)
 Base.metadata.create_all(bind=engine)
